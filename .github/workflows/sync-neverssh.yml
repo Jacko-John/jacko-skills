@@ -1,0 +1,50 @@
+name: sync neverssh skill
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-neverssh
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out skills repository
+        uses: actions/checkout@v4
+
+      - name: Check out NeverSSH skill directory
+        uses: actions/checkout@v4
+        with:
+          repository: Jacko-John/NeverSSH
+          ref: main
+          path: .upstream
+          sparse-checkout: |
+            skills/neverssh
+
+      - name: Copy skill files
+        run: |
+          test -f .upstream/skills/neverssh/SKILL.md
+          rm -rf neverssh
+          mkdir -p neverssh
+          cp -R .upstream/skills/neverssh/. neverssh/
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all -- neverssh
+          if git diff --cached --quiet -- neverssh; then
+            echo "neverssh skill is already up to date"
+            exit 0
+          fi
+          upstream_sha=$(git -C .upstream rev-parse --short HEAD)
+          git commit -m "Sync neverssh skill from NeverSSH@${upstream_sha}"
+          git push
