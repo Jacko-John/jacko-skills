@@ -7,6 +7,7 @@ Agent skill 集合，供 Claude Code 及兼容客户端使用。仓库只包含�
 | Skill | 用途 |
 | --- | --- |
 | `code-craft` | 让每次改动都让代码库更整洁。 |
+| `experiment-design` | 设计并执行可信的实验：先探边界，再立契约、对齐对照、回填攻击。 |
 | `grasp-the-principal-contradiction` | 在复杂任务中找出主要矛盾，决定先做什么。 |
 | `humanizer` | 消除 AI 写作痕迹，保留原意。 |
 | `meet-the-learner` | 从学习者的已知出发，选择贴合当前起点的讲解方式。 |
