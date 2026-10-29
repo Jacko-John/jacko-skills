@@ -1,4 +1,4 @@
 interface:
   display_name: "Research Paper Writing"
-  short_description: "参考相近论文的章法，结合本研究进行原创写作与论证校验"
-  default_prompt: "Use $research-paper-writing to research comparable papers, preferably from my target CCF conference, create or update writing-details.md with sourced writing conventions, and then draft or revise my paper using the general rhetorical route and those details."
+  short_description: "用一句话主张和攻击面驱动写作，惯例只在卡住时对照"
+  default_prompt: "Use $research-paper-writing to state the paper's one-sentence thesis, list three likely rejection reasons with the section answering each, then draft or revise in order of influence: Abstract, Introduction, main figure/table, Method, the rest."
