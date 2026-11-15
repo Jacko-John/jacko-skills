@@ -1,4 +1,4 @@
 interface:
   display_name: "Research Paper Writing"
-  short_description: "用一句话主张和攻击面驱动写作，惯例只在卡住时对照"
-  default_prompt: "Use $research-paper-writing to state the paper's one-sentence thesis, list three likely rejection reasons with the section answering each, then draft or revise in order of influence: Abstract, Introduction, main figure/table, Method, the rest."
+  short_description: "按目标会议品味构建清晰叙事，降低读者理解负担并推敲专业易读语言"
+  default_prompt: "Use $research-paper-writing (and references/workflow.md for multi-section drafting or revision) to align the paper's narrative with the target venue's taste and latest evidence, minimize reader cognitive load with zero assumed context, and draft or revise using precise, accessible academic prose."
