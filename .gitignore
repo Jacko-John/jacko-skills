@@ -3,5 +3,9 @@
 *~
 *.swp
 
+# Python 缓存（skill 脚本运行时生成）
+__pycache__/
+*.py[cod]
+
 # workflow checkout
 .upstream/

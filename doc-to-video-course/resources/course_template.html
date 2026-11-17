@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{COURSE_TITLE}}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<style>
+:root {
+  --ink: #0f172a; --ink-2: #334155; --muted: #64748b;
+  --bg: #faf9f6; --surface: rgba(255, 255, 255, 0.88); --solid: #ffffff;
+  --accent: #2563eb; --accent-deep: #1e40af; --accent-soft: rgba(37, 99, 235, 0.08);
+  --coral: #d9483b; --warm-soft: rgba(217, 72, 59, 0.08);
+  --green: #059669; --green-soft: rgba(5, 150, 105, 0.08);
+  --shadow-lg: 0 24px 60px -16px rgba(15, 23, 42, 0.11), 0 4px 16px -4px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 12px 32px -10px rgba(15, 23, 42, 0.07), 0 2px 6px rgba(15, 23, 42, 0.03);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font: 16px/1.7 -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  background:
+    radial-gradient(950px 500px at 88% 0%, rgba(37, 99, 235, 0.06), transparent 62%),
+    radial-gradient(800px 480px at 10% 95%, rgba(217, 72, 59, 0.04), transparent 62%),
+    radial-gradient(rgba(15, 23, 42, 0.036) 1px, transparent 1px) 0 0 / 26px 26px,
+    var(--bg);
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { font-family: var(--mono); font-size: .88em; background: rgba(15, 23, 42, 0.05); padding: .15em .45em; border-radius: 6px; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 38px 28px 96px; }
+
+header.hero { padding-bottom: 28px; margin-bottom: 30px; }
+header.hero .kicker { color: var(--accent); font-weight: 700; font-size: 12.5px; letter-spacing: .12em; text-transform: uppercase; }
+header.hero h1 { font-size: 38px; font-weight: 800; letter-spacing: -0.025em; line-height: 1.2; margin: 8px 0 12px; }
+header.hero p { color: var(--muted); margin: 0 0 14px; max-width: 68ch; font-size: 17px; }
+.badges { display: flex; gap: 8px; flex-wrap: wrap; }
+.badge { font-size: 12.5px; padding: 5px 13px; border-radius: 999px; background: rgba(15, 23, 42, 0.05); color: var(--ink-2); font-weight: 600; }
+.badge.blue { background: var(--accent-soft); color: var(--accent-deep); }
+.badge.green { background: var(--green-soft); color: var(--green); }
+.badge.warm { background: var(--warm-soft); color: var(--coral); }
+
+.theater { display: grid; grid-template-columns: minmax(0, 1.58fr) minmax(320px, 1fr); gap: 26px; align-items: start; margin-bottom: 40px; }
+.player-card {
+  background: var(--solid);
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+  border: 1px solid rgba(15, 23, 42, 0.05);
+}
+.player-card video { width: 100%; aspect-ratio: 16/9; background: #0b1120; display: block; }
+.player-meta { padding: 22px 26px; }
+.player-meta h2 { margin: 0 0 6px; font-size: 22px; font-weight: 750; letter-spacing: -0.015em; }
+.player-meta p { margin: 0 0 16px; color: var(--muted); font-size: 15px; line-height: 1.6; }
+.player-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.btn {
+  display: inline-block; font-size: 13.5px; font-weight: 600; padding: 8px 16px; border-radius: 999px;
+  border: 1px solid rgba(15, 23, 42, 0.10); background: #fff; color: var(--ink); cursor: pointer; transition: all .15s;
+}
+.btn:hover { background: rgba(15, 23, 42, 0.03); text-decoration: none; }
+.btn.primary { background: var(--ink); border-color: var(--ink); color: #fff; }
+.btn.primary:hover { background: #1e293b; color: #fff; }
+
+.playlist {
+  background: var(--surface);
+  backdrop-filter: blur(14px);
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: var(--shadow-md);
+  border: 1px solid rgba(255, 255, 255, 0.9);
+}
+.playlist-head {
+  padding: 16px 20px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+  font-weight: 700;
+  font-size: 14.5px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.ep-item {
+  width: 100%; text-align: left; border: 0; border-bottom: 1px solid rgba(15, 23, 42, 0.05);
+  background: transparent; padding: 14px 20px; cursor: pointer; display: block; font: inherit; transition: background .15s;
+}
+.ep-item:last-child { border-bottom: 0; }
+.ep-item:hover { background: rgba(15, 23, 42, 0.025); }
+.ep-item.active { background: rgba(37, 99, 235, 0.07); box-shadow: inset 3.5px 0 0 var(--accent); }
+.ep-item .ep-top { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+.ep-item .ep-num { font-weight: 700; color: var(--accent); letter-spacing: .06em; }
+.ep-item .ep-dur { color: var(--muted); font-variant-numeric: tabular-nums; background: rgba(15, 23, 42, 0.05); padding: 1px 8px; border-radius: 999px; }
+.ep-item .ep-title { font-size: 15.5px; font-weight: 700; margin: 4px 0 3px; color: var(--ink); }
+.ep-item .ep-desc { font-size: 13px; color: var(--muted); line-height: 1.48; }
+
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin: 18px 0 36px; }
+.card {
+  background: var(--surface);
+  border-radius: 20px;
+  padding: 20px 22px;
+  box-shadow: var(--shadow-md);
+  border: 1px solid rgba(255, 255, 255, 0.9);
+}
+.card h3 { margin: 0 0 8px; font-size: 17px; color: var(--ink); }
+
+.table-wrap { background: var(--solid); border-radius: 20px; padding: 6px 20px; box-shadow: var(--shadow-md); border: 1px solid rgba(15, 23, 42, 0.05); }
+table.data { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.data th, table.data td { padding: 13px 12px; border-bottom: 1px solid rgba(15, 23, 42, 0.06); text-align: left; }
+table.data tr:last-child td { border-bottom: 0; }
+table.data thead th { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; border-bottom: 1.5px solid rgba(15, 23, 42, 0.1); }
+@media (max-width: 960px) { .theater { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <div class="kicker">{{COURSE_KICKER}}</div>
+    <h1>{{COURSE_TITLE}}</h1>
+    <p>{{COURSE_LEAD}}</p>
+    <div class="badges">
+      <span class="badge blue">1080p @ 30fps · Keynote 工作室风格</span>
+      <span class="badge green">同步配音 + SRT 字幕</span>
+      <span class="badge warm">共 {{EP_COUNT}} 集 · {{TOTAL_MMSS}}</span>
+      {{SOURCE_LINK_BADGE}}
+    </div>
+  </header>
+  <div class="theater">
+    <div class="player-card">
+      <video id="main-player" controls playsinline preload="metadata"><source id="main-src" src="" type="video/mp4"></video>
+      <div class="player-meta">
+        <h2 id="cur-title"></h2>
+        <p id="cur-desc"></p>
+        <div class="player-actions">
+          <a class="btn primary" id="cur-doc-link" href="#">前往原文档互动章节 →</a>
+          <a class="btn" id="cur-dl-mp4" href="#" download>下载 MP4</a>
+          <a class="btn" id="cur-dl-srt" href="#" download>下载 SRT</a>
+        </div>
+      </div>
+    </div>
+    <div class="playlist">
+      <div class="playlist-head"><span>课程目录</span><span style="color:var(--muted);font-weight:500;">{{EP_COUNT}} 集 · {{TOTAL_MMSS}}</span></div>
+      <div id="ep-list"></div>
+    </div>
+  </div>
+  {{CHEATSHEET_HTML}}
+  <h2 style="font-size:22px;margin:32px 0 14px;font-weight:750;">全部文件清单</h2>
+  <div class="table-wrap">
+    <table class="data" id="file-table">
+      <thead><tr><th>集数</th><th>标题</th><th>视频文件</th><th>字幕文件</th><th>时长</th><th>对应章节</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script>
+const EPISODES = {{EPISODES_JSON}};
+const VIDEO_PREFIX = {{VIDEO_PREFIX_JSON}};
+const listEl = document.getElementById("ep-list");
+const tbody = document.querySelector("#file-table tbody");
+const player = document.getElementById("main-player");
+const srcEl = document.getElementById("main-src");
+function selectEp(idx, autoplay) {
+  const ep = EPISODES[idx];
+  document.querySelectorAll(".ep-item").forEach((el, i) => el.classList.toggle("active", i === idx));
+  srcEl.src = VIDEO_PREFIX + encodeURIComponent(ep.file);
+  player.load();
+  if (autoplay) player.play().catch(() => {});
+  document.getElementById("cur-title").textContent = ep.num + " · " + ep.title;
+  document.getElementById("cur-desc").textContent = ep.desc;
+  document.getElementById("cur-doc-link").href = ep.anchor || "#";
+  document.getElementById("cur-dl-mp4").href = VIDEO_PREFIX + encodeURIComponent(ep.file);
+  document.getElementById("cur-dl-srt").href = VIDEO_PREFIX + encodeURIComponent(ep.srt);
+}
+EPISODES.forEach((ep, idx) => {
+  const btn = document.createElement("button");
+  btn.className = "ep-item" + (idx === 0 ? " active" : "");
+  btn.innerHTML = '<div class="ep-top"><span class="ep-num">' + ep.num + '</span><span class="ep-dur">' + ep.dur + '</span></div>' +
+    '<div class="ep-title">' + ep.title + '</div><div class="ep-desc">' + ep.desc + '</div>';
+  btn.addEventListener("click", () => selectEp(idx, true));
+  listEl.appendChild(btn);
+  const tr = document.createElement("tr");
+  tr.innerHTML = '<td><b>' + ep.num + '</b></td><td>' + ep.title + '</td>' +
+    '<td><a href="' + VIDEO_PREFIX + encodeURIComponent(ep.file) + '"><code>' + ep.file + '</code></a></td>' +
+    '<td><a href="' + VIDEO_PREFIX + encodeURIComponent(ep.srt) + '"><code>' + ep.srt + '</code></a></td>' +
+    '<td>' + ep.dur + '</td><td><a href="' + (ep.anchor || '#') + '">查看</a></td>';
+  tbody.appendChild(tr);
+});
+if (EPISODES.length) selectEp(0, false);
+document.addEventListener("DOMContentLoaded", () => {
+  if (window.renderMathInElement) {
+    renderMathInElement(document.body, {
+      delimiters: [{ left: "$$", right: "$$", display: true }, { left: "$", right: "$", display: false }],
+      ignoredTags: ["pre", "code", "script", "style"], throwOnError: false
+    });
+  }
+});
+</script>
+</body>
+</html>
