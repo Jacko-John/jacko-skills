@@ -11,7 +11,7 @@ Agent skill 集合，供 Claude Code 及兼容客户端使用。仓库只包含�
 | `experiment-design` | 设计并执行可信的实验：先探边界，再立契约、对齐对照、回填攻击。 |
 | `grasp-the-principal-contradiction` | 在复杂任务中找出主要矛盾，决定先做什么。 |
 | `humanizer` | 消除 AI 写作痕迹，保留原意。 |
-| `meet-the-learner` | 从学习者的已知出发，选择贴合当前起点的讲解方式。 |
+| `meet-the-reader` | 先用自足、由浅入深的人话讲清问题，再结合读者已知起点与偏好调整深浅。 |
 | `research-paper-writing` | 按目标会议品味构建清晰的论文叙事，控制读者理解负担，推敲专业且易读的学术语言。 |
 | `workspace-cleaner` | 任务收尾时清理临时文件和产物。 |
 | `neverssh` | 通过 NeverSSH MCP 操作远程 SSH 主机。 |
