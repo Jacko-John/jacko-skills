@@ -1,17 +1,32 @@
-"""Fast Chromium pre-render check for episode specs: JS errors, KaTeX dollars, and bounding-box overflow."""
+"""Check DOM/SVG layout and JavaScript at export frames sampled from the narration timeline."""
 import argparse
+import asyncio
 import glob
 import importlib.util
 import os
 import sys
 import warnings
+from bisect import bisect_left
+from collections import defaultdict
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from playwright.sync_api import sync_playwright
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from video_engine import Episode, build_episode_html, find_chrome_exe, get_cache_root
+from browser_runtime import launch_chromium
+from video_engine import (
+    DEFAULT_RATE,
+    DEFAULT_VOICE,
+    FPS,
+    Episode,
+    _build_frame_entries,
+    build_episode_html,
+    get_cache_root,
+    synth_all_beats,
+)
 
 
 def load_episodes_from_dir(spec_dir: str, pattern: str = "ep*.py") -> list[Episode]:
@@ -40,42 +55,78 @@ def load_episodes_from_dir(spec_dir: str, pattern: str = "ep*.py") -> list[Episo
     return episodes
 
 
+def sample_frames(timeline: list[dict], fps: int) -> dict:
+    """Group real export payloads around beat changes and word onsets, with an interior sample."""
+    selected = defaultdict(list)
+    if not timeline:
+        return selected
+    frames = _build_frame_entries(timeline, timeline[-1]["end_sec"], fps)
+    # Export evaluates state at the center of each encoded frame. Match its comparison
+    # exactly even when a spoken boundary falls halfway through a frame.
+    centers = [(i + 0.5) / fps for i in range(len(frames))]
+    probes = set()
+    for item in timeline:
+        start = item["start_sec"]
+        speech_duration = item["speech_end_sec"] - start
+        boundaries = [start, item["speech_end_sec"], item["end_sec"]]
+        boundaries.extend(start + offset for offset in item["marks"].values())
+        for timestamp in boundaries:
+            after = bisect_left(centers, timestamp)
+            probes.update((after - 1, after))
+        fractions = (0.12, 0.92) if item["continuous"] else (0.72,)
+        for fraction in fractions:
+            probes.add(bisect_left(centers, start + fraction * speech_duration))
+
+    for index in sorted(i for i in probes if 0 <= i < len(frames)):
+        payload = frames[index]["payload"]
+        selected[payload["sceneIdx"], payload["beatIdx"]].append((index, payload))
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec-dir", required=True, help="Directory containing ep*.py files")
     parser.add_argument("--pattern", default="ep*.py")
-    parser.add_argument("--sample-dir", default=None, help="Optional dir to save sample JPGs")
+    parser.add_argument("--sample-dir", help="Save scene JPGs and sampled frames for visual comparison")
+    parser.add_argument("--voice", default=DEFAULT_VOICE)
+    parser.add_argument("--rate", default=DEFAULT_RATE)
+    parser.add_argument("--fps", type=int, default=FPS, help="Frame rate of the target export")
     parser.add_argument("--max-bottom", type=float, default=968.0)
     args = parser.parse_args()
+
+    if args.fps < 1:
+        parser.error("--fps must be positive")
 
     episodes = load_episodes_from_dir(args.spec_dir, args.pattern)
     if not episodes:
         raise SystemExit(f"No episodes matched {args.pattern} in {args.spec_dir}")
 
-    tmp_html_dir = os.path.join(get_cache_root(), "validate_html")
-    os.makedirs(tmp_html_dir, exist_ok=True)
+    # Synthesize before starting synchronous Playwright, which owns an asyncio loop.
+    # Per-run WAV copies are disposable. Narration and word boundaries use the export cache.
+    audio_cache = os.path.join(get_cache_root(), "audio_cache")
+    prepared = []
+    for ep in episodes:
+        with TemporaryDirectory(prefix="course-preflight-audio-") as work_dir:
+            timeline = asyncio.run(synth_all_beats(ep, work_dir, audio_cache, args.voice, args.rate))
+        prepared.append((ep, timeline, sample_frames(timeline, args.fps)))
+
     if args.sample_dir:
         os.makedirs(args.sample_dir, exist_ok=True)
 
-    exe = find_chrome_exe()
     page_errors: list[str] = []
     overflows: list[str] = []
     dollar_leaks: list[str] = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path=exe)
+    with TemporaryDirectory(prefix="course-preflight-html-") as tmp_html_dir, sync_playwright() as p:
+        browser = launch_chromium(p)
         page = browser.new_page(viewport={"width": 1920, "height": 1080})
         page.on("pageerror", lambda err: page_errors.append(str(err)))
 
-        for ep in episodes:
+        for ep, timeline, samples in prepared:
             hp = os.path.join(tmp_html_dir, f"ep_{ep.ep_num}.html")
-            build_episode_html(ep, hp)
-            page.goto("file://" + hp, wait_until="load")
+            build_episode_html(ep, hp, timeline=timeline)
+            page.goto(Path(hp).resolve().as_uri(), wait_until="load")
             page.evaluate("document.fonts.ready")
-
-            raw_dollars = page.evaluate("() => document.body.innerText.includes('$$')")
-            if raw_dollars:
-                dollar_leaks.append(f"EP {ep.ep_num}")
 
             pedagogy_warns: list[str] = []
             for si, sc in enumerate(ep.scenes):
@@ -89,30 +140,20 @@ def main():
                             f"EP {ep.ep_num} {sc.scene_id}: all {len(sc.beats)} beats share identical cue (static slide)"
                         )
                 seen_dense_texts: set[str] = set()
-                for bi, bt in enumerate(sc.beats):
-                    p_checks = (0.12, 0.92) if bt.continuous else (0.72,)
-                    for p_val in p_checks:
-                        page.evaluate(
-                            "(p) => window.seekToState(p)",
-                            {
-                                "sceneIdx": si,
-                                "sceneId": sc.scene_id,
-                                "beatIdx": bi,
-                                "cue": bt.cue,
-                                "p": p_val,
-                                "sceneTime": 2.5,
-                                "beatTime": 1.0,
-                                "stepTime": 1.0,
-                                "sub": bt.sub,
-                                "totalProgress": (si + (bi + 0.5) / len(sc.beats)) / max(1, len(ep.scenes)),
-                            },
-                        )
+                if args.sample_dir:
+                    frame_dir = os.path.join(args.sample_dir, f"ep_{ep.ep_num}_{sc.scene_id}")
+                    os.makedirs(frame_dir, exist_ok=True)
+                for bi in range(len(sc.beats)):
+                    for index, payload in samples[si, bi]:
+                        page.evaluate("(p) => window.seekToState(p)", payload)
+                        if args.sample_dir:
+                            page.screenshot(path=os.path.join(frame_dir, f"frame_{index:06d}.jpg"), quality=88)
                         ov = page.evaluate(
                             """() => {
                               const st = document.querySelector('.stage');
                               const sc = document.querySelector('.scene.active');
                               let maxBottom = 0;
-                              for (const k of sc.querySelectorAll('.card, .glass-panel, .svg-card, .code-window, .math-stage, .callout, pre, table, svg')) {
+                              for (const k of sc.querySelectorAll('.card, .glass-panel, .svg-card, .code-window, .code-spotlight, .math-stage, .float-math, .callout, pre, table, svg')) {
                                 const r = k.getBoundingClientRect();
                                 if (r.height > 0 && parseFloat(getComputedStyle(k).opacity) > 0.01) {
                                   maxBottom = Math.max(maxBottom, r.bottom);
@@ -168,15 +209,17 @@ def main():
                                   }
                                 }
                               });
-                              return { scrollH: st.scrollHeight, clientH: st.clientHeight, maxBottom, svgIssues, longTexts };
+                              return { scrollH: st.scrollHeight, clientH: st.clientHeight, maxBottom, svgIssues,
+                                       longTexts, rawDollars: sc.innerText.includes('$$') };
                             }"""
                         )
+                        location = f"EP {ep.ep_num} {sc.scene_id} beat {bi}, frame {index}"
+                        if ov["rawDollars"]:
+                            dollar_leaks.append(location)
                         if ov["scrollH"] > ov["clientH"] + 2 or ov["maxBottom"] > args.max_bottom:
-                            overflows.append(
-                                f"EP {ep.ep_num} {sc.scene_id} beat {bi} (p={p_val}): {ov}"
-                            )
+                            overflows.append(f"{location}: {ov}")
                         for si_msg in ov.get("svgIssues", []):
-                            overflows.append(f"EP {ep.ep_num} {sc.scene_id} beat {bi} (p={p_val}): {si_msg}")
+                            overflows.append(f"{location}: {si_msg}")
                         for lt in ov.get("longTexts", []):
                             if lt not in seen_dense_texts:
                                 seen_dense_texts.add(lt)
@@ -194,7 +237,8 @@ def main():
             for pw in pedagogy_warns:
                 print(f"[PEDAGOGY WARN] {pw}")
             print(
-                f"[OK] EP {ep.ep_num}: {len(ep.scenes)} scenes, {sum(len(s.beats) for s in ep.scenes)} beats checked"
+                f"EP {ep.ep_num}: {len(ep.scenes)} scenes, {len(timeline)} beats, "
+                f"{sum(len(group) for group in samples.values())} sampled frames at {args.fps} fps"
             )
         browser.close()
 
@@ -209,7 +253,7 @@ def main():
                 print("  Overflow:", o)
         raise SystemExit(1)
 
-    print("ALL SCENES PASSED VALIDATION (0 JS errors, 0 KaTeX leaks, 0 overflows).")
+    print("Sampled frames passed JavaScript, KaTeX and DOM/SVG layout checks.")
 
 
 if __name__ == "__main__":

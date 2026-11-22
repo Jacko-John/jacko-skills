@@ -1,25 +1,38 @@
-"""Reusable 1080p @ 30fps HTML/KaTeX/SVG + edge-tts + ffmpeg MP4 video rendering engine (Modern Keynote Studio Edition)."""
+"""Render narrated HTML, SVG and Canvas scenes to 1080p60 MP4."""
 import asyncio
-import glob
+import base64
+import errno
 import hashlib
+import http.server
 import json
 import os
+import re
+import socketserver
+import shutil
+import struct
 import subprocess
+import tempfile
+import threading
 import time
+import warnings
 import wave
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import edge_tts
 import imageio_ffmpeg
 from playwright.sync_api import sync_playwright
 
+from browser_runtime import find_chrome_exe, launch_chromium
 from setup_katex import DEFAULT_CACHE, ensure_katex
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 DEFAULT_VOICE = "zh-CN-YunxiNeural"
 DEFAULT_RATE = "-3%"
-FPS = 30
+FPS = 60
+DOM_ENTER_SEC = 0.7
 SAMPLE_RATE = 48000
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # 16-bit PCM
@@ -27,29 +40,6 @@ SAMPLE_WIDTH = 2  # 16-bit PCM
 
 def get_cache_root() -> str:
     return os.environ.get("D2V_CACHE_DIR", DEFAULT_CACHE)
-
-
-def find_chrome_exe() -> str:
-    candidates = sorted(
-        glob.glob(
-            os.path.expanduser(
-                "~/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell"
-            )
-        )
-    )
-    if candidates:
-        return candidates[-1]
-    for path in (
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-    ):
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(
-        "No Chromium/Chrome executable found. Install Chrome or run `playwright install chromium`."
-    )
 
 
 @dataclass
@@ -61,6 +51,7 @@ class Beat:
     cue: dict = field(default_factory=dict)
     pause_after: float = 0.35
     continuous: bool = False  # True if SVG/Canvas animates continuously across the beat
+    marks: dict = field(default_factory=dict)  # key -> spoken phrase anchor resolved to beatTime (sec)
 
 
 @dataclass
@@ -72,8 +63,9 @@ class Scene:
     html: str
     beats: List[Beat]
     js_init: str = ""
-    js_frame: str = ""  # Receives ctx: {sceneEl, beatIdx, cue, p, sceneTime, beatTime, stepTime}
-    anim_settle_sec: float = 0.75
+    js_frame: str = ""  # ctx.motion measures an interval against its originating beat.
+    anim_settle_sec: float = DOM_ENTER_SEC
+    clean_stage: bool = False  # True hides topbar chrome for centered distraction-free focus
 
 
 @dataclass
@@ -89,6 +81,97 @@ def _tts_cache_key(voice: str, rate: str, text: str) -> str:
     return hashlib.sha256(f"{voice}|{rate}|{text}".encode("utf-8")).hexdigest()[:24]
 
 
+def _norm_match_text(s: str) -> str:
+    return re.sub(r"[\s，。、；：！？“”‘’（）()《》【】\[\],.!?;:\"'·\-]+", "", s or "").lower()
+
+
+def _resolve_beat_marks(
+    tts_text: str, sub_text: str, words: List[dict], marks_spec: dict, speech_dur: float
+) -> dict:
+    """Resolve phrases to word onsets, warning when a legacy text estimate is used."""
+    if not marks_spec:
+        return {}
+    joined_parts = []
+    char_times = []
+    for w in words:
+        nw = _norm_match_text(w.get("text", ""))
+        if not nw:
+            continue
+        t_sec = float(w.get("t", 0.0))
+        for ch in nw:
+            joined_parts.append(ch)
+            char_times.append(t_sec)
+    joined = "".join(joined_parts)
+
+    resolved = {}
+    cursor = 0
+    for key, phrase in marks_spec.items():
+        if isinstance(phrase, (int, float)):
+            resolved[key] = float(phrase)
+            continue
+        needle = _norm_match_text(str(phrase))
+        if not needle:
+            resolved[key] = 0.0
+            continue
+        pos = joined.find(needle, cursor) if joined else -1
+        if pos < 0 and joined:
+            pos = joined.find(needle)
+        if pos >= 0:
+            resolved[key] = char_times[pos]
+            cursor = pos + len(needle)
+            continue
+        # Preserve old specs that mark a notation appearing only in the subtitle.
+        norm_tts = _norm_match_text(tts_text)
+        norm_sub = _norm_match_text(sub_text)
+        idx_tts = norm_tts.find(needle)
+        if idx_tts >= 0 and norm_tts:
+            resolved[key] = (idx_tts / float(len(norm_tts))) * speech_dur
+        else:
+            idx_sub = norm_sub.find(needle)
+            if idx_sub >= 0 and norm_sub:
+                resolved[key] = (idx_sub / float(len(norm_sub))) * speech_dur
+            else:
+                resolved[key] = 0.0
+        warnings.warn(
+            f"No spoken word boundary for {key}={phrase!r} in {tts_text!r}; "
+            f"using fallback {resolved[key]:.3f}s.",
+            stacklevel=2,
+        )
+    return resolved
+
+
+async def _synthesize_take(
+    text: str, voice: str, rate: str, need_words: bool, mp3: Path, staging: Path
+) -> None:
+    for attempt in range(4):
+        try:
+            words = []
+            comm = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
+            with mp3.open("wb") as f:
+                async for chunk in comm.stream():
+                    if chunk["type"] == "audio":
+                        f.write(chunk["data"])
+                    elif chunk["type"] == "WordBoundary":
+                        words.append({
+                            "t": chunk["offset"] / 10_000_000,
+                            "d": chunk["duration"] / 10_000_000,
+                            "text": chunk["text"],
+                        })
+            if need_words and not words:
+                raise ValueError(f"TTS returned no word boundaries for {text!r}")
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            await asyncio.sleep(1 + attempt)
+    subprocess.run([
+        FFMPEG, "-loglevel", "error", "-i", str(mp3),
+        "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+        "-sample_fmt", "s16", str(staging / "audio.wav"),
+    ], check=True)
+    (staging / "words.json").write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
+
+
 async def _synth_one(
     sem: asyncio.Semaphore,
     text: str,
@@ -96,45 +179,42 @@ async def _synth_one(
     audio_cache_dir: str,
     voice: str,
     rate: str,
-) -> float:
-    os.makedirs(audio_cache_dir, exist_ok=True)
+    need_words: bool = False,
+) -> Tuple[float, List[dict]]:
+    root = Path(audio_cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
     key = _tts_cache_key(voice, rate, text)
-    cached_wav = os.path.join(audio_cache_dir, f"{key}.wav")
-    if not os.path.exists(cached_wav):
-        mp3_tmp = os.path.join(audio_cache_dir, f"{key}.mp3")
-        async with sem:
-            for attempt in range(4):
+    take = root / key
+    wav = take / "audio.wav"
+    word_file = take / "words.json"
+    if not take.exists():
+        # Existing courses may have flat WAV caches from before word boundaries.
+        old_wav = root / f"{key}.wav"
+        old_words = root / f"{key}.words.json"
+        old_has_words = old_words.is_file() and bool(json.loads(old_words.read_text(encoding="utf-8")))
+        if old_wav.is_file() and (not need_words or old_has_words):
+            wav, word_file = old_wav, old_words
+        else:
+            # Publish audio and timing from the same take together. Concurrent
+            # workers can race on a phrase, but readers always get one complete pair.
+            with tempfile.TemporaryDirectory(dir=root) as work:
+                staging = Path(work) / "take"
+                staging.mkdir()
+                mp3 = Path(work) / "speech.mp3"
+                async with sem:
+                    await _synthesize_take(text, voice, rate, need_words, mp3, staging)
                 try:
-                    comm = edge_tts.Communicate(text, voice, rate=rate)
-                    await comm.save(mp3_tmp)
-                    break
-                except Exception:
-                    if attempt == 3:
+                    staging.rename(take)
+                except OSError as exc:
+                    if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                         raise
-                    await asyncio.sleep(1.0 + attempt)
-        subprocess.run(
-            [
-                FFMPEG,
-                "-y",
-                "-i",
-                mp3_tmp,
-                "-ar",
-                str(SAMPLE_RATE),
-                "-ac",
-                str(CHANNELS),
-                "-sample_fmt",
-                "s16",
-                cached_wav,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    if wav_out != cached_wav:
-        with open(cached_wav, "rb") as src, open(wav_out, "wb") as dst:
-            dst.write(src.read())
-    with wave.open(cached_wav, "rb") as w:
-        return w.getnframes() / float(w.getframerate())
+    words = json.loads(word_file.read_text(encoding="utf-8")) if word_file.exists() else []
+    if need_words and not words:
+        raise ValueError(f"Empty word boundaries in {word_file} for {text!r}")
+    if Path(wav_out) != wav:
+        shutil.copyfile(wav, wav_out)
+    with wave.open(str(wav), "rb") as w:
+        return w.getnframes() / float(w.getframerate()), words
 
 
 async def synth_all_beats(
@@ -153,19 +233,23 @@ async def synth_all_beats(
             tts_text = bt.tts if bt.tts is not None else bt.sub
             wav_path = os.path.join(ep_work, f"beat_{idx:04d}.wav")
             tasks.append(
-                _synth_one(sem, tts_text, wav_path, audio_cache_dir, voice, rate)
+                _synth_one(
+                    sem, tts_text, wav_path, audio_cache_dir, voice, rate,
+                    need_words=any(isinstance(mark, str) for mark in bt.marks.values()),
+                )
             )
-            meta.append((idx, s_idx, b_idx, sc, bt, wav_path))
+            meta.append((idx, s_idx, b_idx, sc, bt, wav_path, tts_text))
             idx += 1
 
-    durations = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks)
     timeline = []
     cur_sample = 0
     prev_step_key = None
     step_start_sec = 0.0
-    for (i, s_idx, b_idx, sc, bt, wav_path), _dur in zip(meta, durations):
+    for (i, s_idx, b_idx, sc, bt, wav_path, tts_text), (_dur, words) in zip(meta, results):
         with wave.open(wav_path, "rb") as w:
             n_audio_frames = w.getnframes()
+        speech_dur = n_audio_frames / float(SAMPLE_RATE)
         pause_sec = bt.pause_after
         if b_idx == len(sc.beats) - 1:
             pause_sec = max(pause_sec, 0.55)
@@ -180,6 +264,8 @@ async def synth_all_beats(
             step_start_sec = start_sec
             prev_step_key = step_key
 
+        resolved_marks = _resolve_beat_marks(tts_text, bt.sub, words, bt.marks, speech_dur)
+
         timeline.append(
             {
                 "global_idx": i,
@@ -189,6 +275,7 @@ async def synth_all_beats(
                 "beat_idx": b_idx,
                 "sub": bt.sub,
                 "cue": bt.cue,
+                "marks": resolved_marks,
                 "continuous": bt.continuous,
                 "anim_settle_sec": sc.anim_settle_sec,
                 "wav_path": wav_path,
@@ -580,6 +667,47 @@ table.data tr.focus td { background: rgba(37, 99, 235, 0.11); }
 }
 .term-chip b { color: var(--ink); }
 
+/* Clean distraction-free mode & Full-Stage Centered Canvas */
+.frame-shell.clean-mode .topbar { opacity: 0; pointer-events: none; }
+.mg-stage {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1920px;
+  height: 1080px;
+  z-index: 1;
+  pointer-events: none;
+}
+.center-stage {
+  position: relative;
+  z-index: 10;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+.float-math {
+  position: relative;
+  z-index: 10;
+  display: inline-block;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(10px);
+  border-radius: 20px;
+  padding: 16px 32px;
+  box-shadow: var(--shadow-md);
+  border: 1px solid rgba(37, 99, 235, 0.14);
+  font-size: 28px;
+}
+.code-spotlight {
+  position: relative;
+  z-index: 10;
+  width: min(980px, 90%);
+  margin: 0 auto;
+  text-align: left;
+}
+
 /* Step transitions & declarative focus signaling */
 .step { opacity: 0; transform: translateY(10px); }
 .step.show { opacity: 1; transform: translateY(0); }
@@ -587,7 +715,7 @@ table.data tr.focus td { background: rgba(37, 99, 235, 0.11); }
 .step.focus-warm { box-shadow: 0 18px 44px -12px rgba(217, 72, 59, 0.18), 0 0 0 1.5px rgba(217, 72, 59, 0.28) !important; }
 .step.focus-green { box-shadow: 0 18px 44px -12px rgba(5, 150, 105, 0.18), 0 0 0 1.5px rgba(5, 150, 105, 0.28) !important; }
 .focus-dim { opacity: 0.34 !important; }
-.focus-active { opacity: 1 !important; box-shadow: 0 14px 36px -10px rgba(37, 99, 235, 0.22), 0 0 0 2px rgba(37, 99, 235, 0.38) !important; }
+.focus-active { box-shadow: 0 14px 36px -10px rgba(37, 99, 235, 0.22), 0 0 0 2px rgba(37, 99, 235, 0.38) !important; }
 .focus-active.warm { box-shadow: 0 14px 36px -10px rgba(217, 72, 59, 0.22), 0 0 0 2px rgba(217, 72, 59, 0.38) !important; }
 .focus-active.green { box-shadow: 0 14px 36px -10px rgba(5, 150, 105, 0.22), 0 0 0 2px rgba(5, 150, 105, 0.38) !important; }
 
@@ -627,7 +755,9 @@ function svgEl(tag, attrs, parent) {
 }
 function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
 function easeOutCubic(t) { t = clamp(t, 0, 1); return 1 - Math.pow(1 - t, 3); }
-function easeInOut(t) { t = clamp(t, 0, 1); return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2; }
+function easeOutQuart(t) { t = clamp(t, 0, 1); return 1 - Math.pow(1 - t, 4); }
+function easeInOut(t) { t = clamp(t, 0, 1); return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+function easeWhip(t) { t = clamp(t, 0, 1); return t < 0.5 ? 8 * t * t * t * t : 1 - Math.pow(-2 * t + 2, 4) / 2; }
 function fmt(v, d) {
   const s = (d === undefined ? v.toFixed(3) : v.toFixed(d));
   return s.replace(/^-0(\.0+)?$/, (m) => m.slice(1));
@@ -830,13 +960,530 @@ function svgConnector(svg, x1, y1, x2, y2, opts) {
   }
   return path;
 }
+
+/* =========================================================================
+ * Warm Alabaster Motion Graphics (MG) Canvas Toolkit
+ * ========================================================================= */
+const lerp = (a, b, t) => a + (b - a) * clamp(t, 0, 1);
+const subP = (p, t0, t1) => clamp((p - t0) / Math.max(1e-5, t1 - t0), 0, 1);
+const secP = (t, t0, dur) => clamp((t - t0) / Math.max(1e-5, dur), 0, 1);
+function mgPulse(t, base, amp, speed) {
+  return (base || 1) + (amp || 0.04) * Math.sin((t || 0) * (speed || 4.2));
+}
+function spring(t) {
+  t = clamp(t, 0, 1);
+  if (t === 0 || t === 1) return t;
+  // Crisp easeOutBack (~6.5% settle overshoot for lively card/badge entrances)
+  const s = 1.55;
+  const u = t - 1;
+  return 1 + u * u * ((s + 1) * u + s);
+}
+function mgPop(t) {
+  t = clamp(t, 0, 1);
+  const sp = spring(t);
+  return {
+    alpha: easeOutCubic(subP(t, 0, 0.42)),
+    scale: 0.86 + 0.14 * sp,
+    yOff: (1 - easeOutQuart(t)) * 20,
+  };
+}
+function wiggle(tSec, freq, amp) {
+  const t = Math.max(0, tSec);
+  if (t <= 0) return 0;
+  return Math.sin(t * (freq || 34)) * (amp || 8) * Math.exp(-2.6 * t);
+}
+function mgRoundRect(c, x, y, w, h, r) {
+  r = Math.min(r || 14, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.lineTo(x + w - r, y);
+  c.quadraticCurveTo(x + w, y, x + w, y + r);
+  c.lineTo(x + w, y + h - r);
+  c.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  c.lineTo(x + r, y + h);
+  c.quadraticCurveTo(x, y + h, x, y + h - r);
+  c.lineTo(x, y + r);
+  c.quadraticCurveTo(x, y, x + r, y);
+  c.closePath();
+}
+function mgClear(c) {
+  c.clearRect(0, 0, 1920, 1080);
+}
+function mgCamera(c, scale, panX, panY, cx, cy) {
+  const ox = cx === undefined ? 960 : cx;
+  const oy = cy === undefined ? 500 : cy;
+  c.translate(ox + (panX || 0), oy + (panY || 0));
+  c.scale(scale || 1, scale || 1);
+  c.translate(-ox, -oy);
+}
+function mgPill(c, cx, cy, text, opts) {
+  const o = opts || {};
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (alpha <= 0.01) return;
+  c.save();
+  c.globalAlpha *= alpha;
+  c.font = o.font || "700 20px -apple-system, 'PingFang SC', sans-serif";
+  const tw = c.measureText(text).width;
+  const pw = tw + (o.padX || 32), ph = o.h || 40;
+  mgRoundRect(c, cx - pw / 2, cy - ph / 2, pw, ph, ph / 2);
+  c.fillStyle = o.bg || "rgba(255, 255, 255, 0.94)";
+  c.fill();
+  c.lineWidth = o.lw || 1.6;
+  c.strokeStyle = o.stroke || "rgba(37, 99, 235, 0.28)";
+  c.stroke();
+  c.fillStyle = o.fg || "#1e40af";
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.fillText(text, cx, cy + 1);
+  c.restore();
+}
+function mgNode(c, x, y, w, h, title, sub, opts) {
+  const o = opts || {};
+  const state = o.state || "idle";
+  const tones = {
+    idle:   { bg: "rgba(255,255,255,0.95)", stroke: "rgba(15,23,42,0.14)", title: "#0f172a", op: 1, lw: 1.6 },
+    active: { bg: "#eff6ff", stroke: "#2563eb", title: "#1e40af", op: 1, lw: 2.6 },
+    warm:   { bg: "#fff1f2", stroke: "#d9483b", title: "#be123c", op: 1, lw: 2.6 },
+    green:  { bg: "#ecfdf5", stroke: "#059669", title: "#047857", op: 1, lw: 2.6 },
+    amber:  { bg: "#fffbeb", stroke: "#d97706", title: "#b45309", op: 1, lw: 2.6 },
+    dim:    { bg: "rgba(248,250,252,0.9)", stroke: "rgba(15,23,42,0.08)", title: "#64748b", op: 0.36, lw: 1.2 },
+  };
+  const st = tones[state] || tones.idle;
+  const alpha = o.alpha === undefined ? st.op : o.alpha * st.op;
+  if (alpha <= 0.01) return;
+  c.save();
+  c.globalAlpha *= alpha;
+  const dx = o.shakeX || 0, dy = o.shakeY || 0;
+  if (o.scale !== undefined && o.scale !== 1) {
+    const cx = x + dx + w / 2, cy = y + dy + h / 2;
+    c.translate(cx, cy);
+    c.scale(o.scale, o.scale);
+    c.translate(-cx, -cy);
+  }
+  c.shadowColor = state === "active" ? "rgba(37,99,235,0.16)" : (state === "warm" ? "rgba(217,72,59,0.16)" : "rgba(15,23,42,0.08)");
+  c.shadowBlur = state === "dim" ? 6 : 24;
+  c.shadowOffsetY = 8;
+  mgRoundRect(c, x + dx, y + dy, w, h, o.r || 18);
+  c.fillStyle = o.bg || st.bg;
+  c.fill();
+  c.shadowColor = "transparent";
+  c.lineWidth = st.lw;
+  c.strokeStyle = o.stroke || st.stroke;
+  c.stroke();
+  c.fillStyle = st.title;
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.font = o.titleFont || "700 22px -apple-system, 'PingFang SC', sans-serif";
+  c.fillText(title, x + dx + w / 2, sub ? y + dy + h * 0.40 : y + dy + h * 0.52);
+  if (sub) {
+    c.fillStyle = "#64748b";
+    c.font = o.subFont || "600 16px ui-monospace, SFMono-Regular, sans-serif";
+    c.fillText(sub, x + dx + w / 2, y + dy + h * 0.70);
+  }
+  c.restore();
+}
+function mgArrow(c, x1, y1, x2, y2, opts) {
+  const o = opts || {};
+  const p = o.progress === undefined ? 1 : clamp(o.progress, 0, 1);
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (p <= 0.02 || alpha <= 0.01) return;
+  const col = o.color || "#2563eb";
+  const curve = o.curve || 0;
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2 - curve;
+  c.save();
+  c.globalAlpha *= alpha;
+  c.strokeStyle = col;
+  c.fillStyle = col;
+  c.lineWidth = o.lw || 3.2;
+  c.lineCap = "round";
+  if (o.dash) c.setLineDash(o.dash);
+  c.beginPath();
+  c.moveTo(x1, y1);
+  let ex = lerp(x1, x2, p), ey = lerp(y1, y2, p);
+  let tx = x1, ty = y1;
+  if (curve === 0) {
+    c.lineTo(ex, ey);
+  } else {
+    const steps = 36;
+    for (let i = 1; i <= steps; i++) {
+      const t = p * (i / steps);
+      const mt = 1 - t;
+      const qx = mt*mt*x1 + 2*mt*t*mx + t*t*x2;
+      const qy = mt*mt*y1 + 2*mt*t*my + t*t*y2;
+      if (i === steps - 1) { tx = qx; ty = qy; }
+      ex = qx; ey = qy;
+      c.lineTo(qx, qy);
+    }
+  }
+  c.stroke();
+  c.setLineDash([]);
+  if (p > 0.08 && !o.noHead) {
+    const ang = Math.atan2(ey - ty, ex - tx);
+    const hl = (o.headLen || 13) * clamp((p - 0.08) / 0.28, 0, 1);
+    if (hl > 1) {
+      c.beginPath();
+      c.moveTo(ex, ey);
+      c.lineTo(ex - hl * Math.cos(ang - 0.42), ey - hl * Math.sin(ang - 0.42));
+      c.lineTo(ex - hl * Math.cos(ang + 0.42), ey - hl * Math.sin(ang + 0.42));
+      c.closePath();
+      c.fill();
+    }
+  }
+  if (o.label && p > 0.30) {
+    mgPill(c, mx, my - (curve === 0 ? 22 : 10), o.label, {
+      bg: o.labelBg || "rgba(255,255,255,0.94)", fg: col, stroke: col,
+      font: "700 17px -apple-system, 'PingFang SC', sans-serif",
+      alpha: clamp((p - 0.30) / 0.35, 0, 1),
+    });
+  }
+  c.restore();
+}
+function mgPacket(c, pts, progress, label, opts) {
+  if (!pts || pts.length < 2) return;
+  const o = opts || {};
+  const p = clamp(progress, 0, 1);
+  const segs = [];
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const len = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    segs.push(len);
+    total += len;
+  }
+  let target = total * p, px = pts[0][0], py = pts[0][1];
+  for (let i = 0; i < segs.length; i++) {
+    if (target <= segs[i] || i === segs.length - 1) {
+      const t = segs[i] > 0 ? clamp(target / segs[i], 0, 1) : 0;
+      px = lerp(pts[i][0], pts[i + 1][0], t);
+      py = lerp(pts[i][1], pts[i + 1][1], t);
+      break;
+    }
+    target -= segs[i];
+  }
+  const col = o.color || "#2563eb";
+  c.save();
+  c.globalAlpha *= o.alpha === undefined ? 1 : o.alpha;
+  c.fillStyle = col + "28";
+  c.beginPath();
+  c.arc(px, py, (o.r || 12) * 1.9, 0, Math.PI * 2);
+  c.fill();
+  c.fillStyle = col;
+  c.strokeStyle = "#ffffff";
+  c.lineWidth = 3;
+  c.beginPath();
+  c.arc(px, py, o.r || 12, 0, Math.PI * 2);
+  c.fill();
+  c.stroke();
+  if (label) {
+    mgPill(c, px, py - (o.r || 12) - 24, label, {
+      bg: "#ffffff", fg: col, stroke: col, h: 32, padX: 20, font: "700 16px ui-monospace, 'PingFang SC', sans-serif"
+    });
+  }
+  c.restore();
+}
+function mgAxes(c, b, opts) {
+  const o = opts || {};
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (alpha <= 0.01) return null;
+  const sx = (v) => b.x + ((v - b.xmin) / (b.xmax - b.xmin)) * b.w;
+  const sy = (v) => b.y + b.h - ((v - b.ymin) / (b.ymax - b.ymin)) * b.h;
+  const baseY = sy(Math.max(b.ymin, 0));
+  c.save();
+  c.globalAlpha *= alpha;
+  for (const yv of (o.yTicks || [])) {
+    c.strokeStyle = "rgba(15, 23, 42, 0.07)";
+    c.lineWidth = 1.2;
+    c.beginPath();
+    c.moveTo(b.x, sy(yv));
+    c.lineTo(b.x + b.w, sy(yv));
+    c.stroke();
+    c.fillStyle = "#64748b";
+    c.font = "500 17px ui-monospace, SFMono-Regular, monospace";
+    c.textAlign = "right";
+    c.textBaseline = "middle";
+    c.fillText(yv.toFixed(o.ydec === undefined ? 1 : o.ydec), b.x - 16, sy(yv));
+  }
+  c.strokeStyle = "rgba(15, 23, 42, 0.28)";
+  c.lineWidth = 2.2;
+  c.beginPath();
+  c.moveTo(b.x - 10, baseY);
+  c.lineTo(b.x + b.w + 14, baseY);
+  if (b.xmin <= 0 && b.xmax >= 0) {
+    c.moveTo(sx(0), baseY + 14);
+    c.lineTo(sx(0), b.y - 14);
+  }
+  c.stroke();
+  if (o.xTicks) {
+    c.fillStyle = "#475569";
+    c.font = "600 18px ui-monospace, SFMono-Regular, monospace";
+    c.textAlign = "center";
+    c.textBaseline = "top";
+    for (const xv of o.xTicks) {
+      c.fillText(xv.toFixed(o.xdec === undefined ? 1 : o.xdec), sx(xv), baseY + 16);
+    }
+  }
+  if (o.xLabel) {
+    c.fillStyle = "#475569";
+    c.font = "italic 700 22px Georgia, serif";
+    c.textAlign = "left";
+    c.textBaseline = "middle";
+    c.fillText(o.xLabel, b.x + b.w + 22, baseY);
+  }
+  c.restore();
+  return { sx, sy, baseY };
+}
+function mgCurve(c, sx, sy, fn, x0, x1, opts) {
+  const o = opts || {};
+  const p = o.progress === undefined ? 1 : clamp(o.progress, 0, 1);
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (p <= 0.01 || alpha <= 0.01) return;
+  const xEnd = lerp(x0, x1, p);
+  const step = (x1 - x0) / (o.steps || 120);
+  const pts = [];
+  for (let x = x0; x <= xEnd + 1e-6; x += step) {
+    pts.push([sx(x), sy(fn(x))]);
+  }
+  if (pts.length < 2) return;
+  c.save();
+  c.globalAlpha *= alpha;
+  if (o.fill && o.baseY !== undefined) {
+    c.beginPath();
+    c.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+    c.lineTo(pts[pts.length - 1][0], o.baseY);
+    c.lineTo(pts[0][0], o.baseY);
+    c.closePath();
+    c.fillStyle = o.fill;
+    c.fill();
+  }
+  c.strokeStyle = o.color || "#2563eb";
+  c.lineWidth = o.lw || 4.2;
+  c.lineCap = "round";
+  c.lineJoin = "round";
+  if (o.dash) c.setLineDash(o.dash);
+  c.beginPath();
+  c.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+  c.stroke();
+  c.restore();
+}
+function mgDot(c, x, y, color, r, halo) {
+  c.save();
+  if (halo) {
+    c.fillStyle = color + "2b";
+    c.beginPath();
+    c.arc(x, y, (r || 8) * 2.1, 0, Math.PI * 2);
+    c.fill();
+  }
+  c.fillStyle = color;
+  c.strokeStyle = "#ffffff";
+  c.lineWidth = 3;
+  c.beginPath();
+  c.arc(x, y, r || 8, 0, Math.PI * 2);
+  c.fill();
+  c.stroke();
+  c.restore();
+}
+function mgFormula(c, cx, cy, text, opts) {
+  const o = opts || {};
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (alpha <= 0.01) return;
+  c.save();
+  c.globalAlpha *= alpha;
+  c.font = o.font || "700 32px Georgia, 'Times New Roman', serif";
+  const tw = c.measureText(text).width;
+  const pw = tw + 56, ph = 74;
+  c.shadowColor = "rgba(15, 23, 42, 0.08)";
+  c.shadowBlur = 24;
+  c.shadowOffsetY = 8;
+  mgRoundRect(c, cx - pw / 2, cy - ph / 2, pw, ph, 20);
+  c.fillStyle = "rgba(255, 255, 255, 0.96)";
+  c.fill();
+  c.shadowColor = "transparent";
+  c.lineWidth = 1.6;
+  c.strokeStyle = o.stroke || "rgba(37, 99, 235, 0.22)";
+  c.stroke();
+  c.fillStyle = o.fg || "#0f172a";
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.fillText(text, cx, cy + 1);
+  c.restore();
+}
+function mgHeader(c, cx, cy, eyebrow, title, opts) {
+  const o = opts || {};
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (alpha <= 0.01) return;
+  c.save();
+  c.globalAlpha *= alpha;
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  if (eyebrow) {
+    c.fillStyle = o.eyebrowColor || "#2563eb";
+    c.font = o.eyebrowFont || "700 17px -apple-system, 'PingFang SC', sans-serif";
+    c.fillText(eyebrow, cx, cy - (o.gap || 26));
+  }
+  if (title) {
+    c.fillStyle = o.titleColor || "#0f172a";
+    c.font = o.titleFont || "800 38px -apple-system, 'PingFang SC', sans-serif";
+    c.fillText(title, cx, eyebrow ? cy + (o.gap || 20) : cy);
+  }
+  c.restore();
+}
+function mgPanel(c, x, y, w, h, title, opts) {
+  const o = opts || {};
+  const state = o.state || "green";
+  const tones = {
+    idle:   { bg: "rgba(255,255,255,0.92)", stroke: "rgba(15,23,42,0.14)", title: "#0f172a" },
+    active: { bg: "#eff6ff", stroke: "#2563eb", title: "#1e40af" },
+    warm:   { bg: "#fff1f2", stroke: "#d9483b", title: "#be123c" },
+    green:  { bg: "#ecfdf5", stroke: "#059669", title: "#047857" },
+    amber:  { bg: "#fffbeb", stroke: "#d97706", title: "#b45309" },
+  };
+  const st = tones[state] || tones.green;
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (alpha <= 0.01) return;
+  c.save();
+  c.globalAlpha *= alpha;
+  c.shadowColor = "rgba(15, 23, 42, 0.08)";
+  c.shadowBlur = 28;
+  c.shadowOffsetY = 10;
+  mgRoundRect(c, x, y, w, h, o.r || 22);
+  c.fillStyle = o.bg || st.bg;
+  c.fill();
+  c.shadowColor = "transparent";
+  c.lineWidth = o.lw || 2.4;
+  c.strokeStyle = o.stroke || st.stroke;
+  c.stroke();
+  if (title) {
+    c.fillStyle = o.titleColor || st.title;
+    c.font = o.titleFont || "700 26px -apple-system, 'PingFang SC', sans-serif";
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.fillText(title, x + w / 2, y + (o.titleOffset || 44));
+  }
+  c.restore();
+}
+function _mgTokenizePy(src) {
+  const kw = new Set(["def", "return", "for", "in", "if", "else", "elif", "import", "from", "as", "with", "None", "True", "False", "and", "or", "not"]);
+  const out = [];
+  const re = /([A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|"[^"]*"|'[^']*'|[^\sA-Za-z0-9_"']+|\s+)/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const tok = m[0];
+    let color = "#e2e8f0";
+    if (kw.has(tok)) color = "#c084fc";
+    else if (/^\d/.test(tok)) color = "#fbbf24";
+    else if (/^["']/.test(tok)) color = "#86efac";
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)) {
+      const rest = src.slice(re.lastIndex);
+      if (rest.startsWith("(")) color = "#7dd3fc";
+      else if (tok === "np" || tok === "torch" || tok === "dim") color = "#93c5fd";
+    } else if (/^[=+\-*/(),.[\]:<>]+$/.test(tok.trim())) {
+      color = "#94a3b8";
+    }
+    out.push({ text: tok, color });
+  }
+  return out;
+}
+function mgCodeWindow(c, x, y, w, h, opts) {
+  const o = opts || {};
+  const alpha = o.alpha === undefined ? 1 : o.alpha;
+  if (alpha <= 0.01) return;
+  const lines = o.lines || [];
+  const headerH = o.headerH || 54;
+  const padX = o.padX || 36;
+  const rowH = o.rowH || Math.min(62, (h - headerH - 36) / Math.max(1, lines.length));
+  const startY = y + headerH + 22;
+  c.save();
+  c.globalAlpha *= alpha;
+  c.shadowColor = "rgba(15, 23, 42, 0.24)";
+  c.shadowBlur = 40;
+  c.shadowOffsetY = 16;
+  mgRoundRect(c, x, y, w, h, o.r || 20);
+  c.fillStyle = "#0b1120";
+  c.fill();
+  c.shadowColor = "transparent";
+  c.lineWidth = 1.5;
+  c.strokeStyle = "rgba(148, 163, 184, 0.22)";
+  c.stroke();
+
+  // macOS window chrome bar
+  c.save();
+  mgRoundRect(c, x, y, w, h, o.r || 20);
+  c.clip();
+  c.fillStyle = "rgba(255, 255, 255, 0.035)";
+  c.fillRect(x, y, w, headerH);
+  c.strokeStyle = "rgba(255, 255, 255, 0.08)";
+  c.lineWidth = 1;
+  c.beginPath();
+  c.moveTo(x, y + headerH);
+  c.lineTo(x + w, y + headerH);
+  c.stroke();
+  const dots = ["#ff5f56", "#ffbd2e", "#27c93f"];
+  for (let i = 0; i < 3; i++) {
+    c.fillStyle = dots[i];
+    c.beginPath();
+    c.arc(x + 28 + i * 24, y + headerH / 2, 7.5, 0, Math.PI * 2);
+    c.fill();
+  }
+  if (o.filename) {
+    c.fillStyle = "#94a3b8";
+    c.font = "600 17px ui-monospace, SFMono-Regular, Menlo, monospace";
+    c.textAlign = "right";
+    c.textBaseline = "middle";
+    c.fillText(o.filename, x + w - 26, y + headerH / 2);
+  }
+  c.restore();
+
+  const codeFont = o.codeFont || "500 26px ui-monospace, SFMono-Regular, Menlo, monospace";
+  const commentFont = o.commentFont || "500 22px -apple-system, 'PingFang SC', ui-monospace, monospace";
+  const commentX = x + (o.commentOffset || Math.round(w * 0.56));
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    const lineAlpha = ln.alpha === undefined ? 1 : clamp(ln.alpha, 0, 1);
+    if (lineAlpha <= 0.01) continue;
+    const hl = clamp(ln.highlight || 0, 0, 1);
+    const ry = startY + i * rowH;
+    const midY = ry + rowH / 2;
+    c.save();
+    c.globalAlpha *= lineAlpha;
+    if (hl > 0.01) {
+      mgRoundRect(c, x + 16, ry + 3, w - 32, rowH - 6, 11);
+      c.fillStyle = `rgba(56, 189, 248, ${(0.14 * hl).toFixed(3)})`;
+      c.fill();
+      c.lineWidth = 1.6;
+      c.strokeStyle = `rgba(56, 189, 248, ${(0.62 * hl).toFixed(3)})`;
+      c.stroke();
+      mgRoundRect(c, x + 16, ry + 10, 4.5, rowH - 20, 2);
+      c.fillStyle = `rgba(56, 189, 248, ${hl.toFixed(3)})`;
+      c.fill();
+    }
+    const tokens = ln.tokens || _mgTokenizePy(ln.code || "");
+    c.font = codeFont;
+    c.textAlign = "left";
+    c.textBaseline = "middle";
+    let cx = x + padX;
+    for (const tok of tokens) {
+      c.fillStyle = hl > 0.4 ? (tok.color === "#e2e8f0" ? "#f8fafc" : tok.color) : tok.color;
+      c.fillText(tok.text, cx, midY);
+      cx += c.measureText(tok.text).width;
+    }
+    if (ln.comment) {
+      c.font = commentFont;
+      c.fillStyle = hl > 0.4 ? "#94a3b8" : "#475569";
+      c.fillText(ln.comment, Math.max(cx + 28, commentX), midY);
+    }
+    c.restore();
+  }
+  c.restore();
+}
 """
 
 
 def build_episode_html(
-    episode: Episode, ep_html_path: str, katex_dir: Optional[str] = None
+    episode: Episode, ep_html_path: str, katex_dir: Optional[str] = None,
+    timeline: Optional[List[dict]] = None,
 ) -> None:
-    katex_root = ensure_katex(katex_dir)
+    katex_root = Path(ensure_katex(katex_dir)).resolve().as_uri()
     scenes_html = []
     dots_html = []
     for i, sc in enumerate(episode.scenes):
@@ -845,6 +1492,18 @@ def build_episode_html(
 
     init_calls = []
     frame_cases = []
+    # Store the narration clock once in the page. Drawing an arbitrary frame,
+    # including a backwards seek, never depends on having drawn the previous one.
+    scene_clocks = [[] for _ in episode.scenes]
+    for item in timeline or []:
+        beats = scene_clocks[item["scene_idx"]]
+        if not beats:
+            scene_start = item["start_sec"]
+        beats.append({
+            "start": item["start_sec"] - scene_start,
+            "speechDuration": item["speech_end_sec"] - item["start_sec"],
+            "marks": item["marks"],
+        })
     for sc in episode.scenes:
         if sc.js_init.strip():
             init_calls.append(
@@ -859,10 +1518,10 @@ def build_episode_html(
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<link rel="stylesheet" href="file://{katex_root}/katex.min.css">
-<script src="file://{katex_root}/katex.min.js"></script>
-<script src="file://{katex_root}/auto-render.min.js"></script>
-<style>
+<link id="course-math-css" rel="stylesheet" href="{katex_root}/katex.min.css">
+<script src="{katex_root}/katex.min.js"></script>
+<script src="{katex_root}/auto-render.min.js"></script>
+<style id="course-stage-css">
 {SHARED_CSS}
 </style>
 </head>
@@ -901,13 +1560,43 @@ renderMathInElement(document.body, {{
 
 const SCENE_IDS = {json.dumps([sc.scene_id for sc in episode.scenes])};
 const SECTION_LABELS = {json.dumps([sc.section_label for sc in episode.scenes], ensure_ascii=False)};
+const CLEAN_STAGES = {json.dumps([sc.clean_stage for sc in episode.scenes])};
+const SCENE_CLOCKS = {json.dumps(scene_clocks)};
+
+function motionProgress(sceneIdx, sceneTime, beatIdx, start, end) {{
+  const beat = SCENE_CLOCKS[sceneIdx][beatIdx];
+  if (!beat) throw new Error("Missing narration timing for scene " + SCENE_IDS[sceneIdx] + ", beat " + beatIdx);
+  const from = typeof start === "string" ? beat.marks[start] : start;
+  const to = end == null ? beat.speechDuration : (typeof end === "string" ? beat.marks[end] : end);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {{
+    throw new Error("Invalid motion interval in " + SCENE_IDS[sceneIdx] + " beat " + beatIdx + ": " + start + " → " + end);
+  }}
+  return secP(sceneTime - beat.start, from, to - from);
+}}
+
+function motionElapsed(sceneIdx, sceneTime, beatIdx, start) {{
+  const beat = SCENE_CLOCKS[sceneIdx][beatIdx];
+  if (!beat) throw new Error("Missing narration timing for scene " + SCENE_IDS[sceneIdx] + ", beat " + beatIdx);
+  const from = typeof start === "string" ? beat.marks[start] : start;
+  if (!Number.isFinite(from)) {{
+    throw new Error("Invalid motion anchor in " + SCENE_IDS[sceneIdx] + " beat " + beatIdx + ": " + start);
+  }}
+  return Math.max(0, (sceneTime - beat.start) - from);
+}}
+
+function motionSnap(sceneIdx, sceneTime, beatIdx, start, durSec) {{
+  const dur = durSec === undefined ? 0.26 : durSec;
+  return clamp(motionElapsed(sceneIdx, sceneTime, beatIdx, start) / Math.max(1e-4, dur), 0, 1);
+}}
 
 {chr(10).join(init_calls)}
 
 window.seekToState = function(payload) {{
-  const {{ sceneIdx, sceneId, beatIdx, cue, p, sceneTime, beatTime, stepTime, sub, totalProgress }} = payload;
+  const {{ sceneIdx, sceneId, beatIdx, cue, p, sceneTime, beatTime, stepTime, marks, sub, totalProgress }} = payload;
   document.getElementById("prog-bar").style.width = (totalProgress * 100).toFixed(2) + "%";
   document.getElementById("sec-title").textContent = SECTION_LABELS[sceneIdx] || "";
+  const isClean = Boolean(CLEAN_STAGES[sceneIdx] || (cue && cue.clean));
+  document.querySelector(".frame-shell").classList.toggle("clean-mode", isClean);
   for (let i = 0; i < SCENE_IDS.length; i++) {{
     const scEl = document.getElementById("scene-" + SCENE_IDS[i]);
     const dotEl = document.getElementById("dot-" + i);
@@ -930,8 +1619,7 @@ window.seekToState = function(payload) {{
 
   const sceneEl = document.getElementById("scene-" + sceneId);
   const curStep = (cue && cue.step !== undefined) ? cue.step : beatIdx;
-  const enterT = Math.min(1, Math.max(0, (stepTime === undefined ? beatTime : stepTime) / 0.42));
-  const ease = 1 - Math.pow(1 - enterT, 3);
+  const ease = easeInOut((stepTime === undefined ? beatTime : stepTime) / {DOM_ENTER_SEC});
   const isElVisible = (el) => {{
     if (el.hasAttribute("data-step")) {{
       const req = parseInt(el.getAttribute("data-step"), 10);
@@ -1012,7 +1700,12 @@ window.seekToState = function(payload) {{
     }});
   }}
 
-  const ctx = {{ sceneEl, beatIdx, cue: cue || {{}}, p, sceneTime, beatTime, stepTime: stepTime === undefined ? beatTime : stepTime }};
+  const ctx = {{ sceneEl, beatIdx, cue: cue || {{}}, p, sceneTime, beatTime,
+    stepTime: stepTime === undefined ? beatTime : stepTime, marks: marks || {{}},
+    motion: (originBeat, start, end) => motionProgress(sceneIdx, sceneTime, originBeat, start, end),
+    snap: (originBeat, start, durSec) => motionSnap(sceneIdx, sceneTime, originBeat, start, durSec),
+    elapsed: (originBeat, start) => motionElapsed(sceneIdx, sceneTime, originBeat, start),
+  }};
   {chr(10).join(frame_cases)}
 }};
 </script>
@@ -1022,42 +1715,315 @@ window.seekToState = function(payload) {{
         f.write(html)
 
 
-def render_episode(
+def _start_local_asset_server(work_dir: str, katex_dir: str) -> Tuple[socketserver.TCPServer, int]:
+    """Serve ep_work and offline KaTeX assets over 127.0.0.1 so WebCodecs runs in a Secure Context."""
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def translate_path(self, path: str) -> str:
+            self.directory = work_dir
+            if path.startswith("/katex/"):
+                self.directory = katex_dir
+                path = path[len("/katex"):]
+            return super().translate_path(path)
+
+        def log_message(self, format: str, *args) -> None:
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), QuietHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, port
+
+
+def _build_frame_entries(timeline: List[dict], total_dur: float, fps: int) -> List[dict]:
+    scene_start_times = {}
+    for item in timeline:
+        if item["scene_idx"] not in scene_start_times:
+            scene_start_times[item["scene_idx"]] = item["start_sec"]
+
+    total_frames = int(round(total_dur * fps))
+    entries = []
+    t_idx = 0
+    for f_idx in range(total_frames):
+        t_sec = (f_idx + 0.5) / fps
+        while t_idx + 1 < len(timeline) and t_sec >= timeline[t_idx]["end_sec"]:
+            t_idx += 1
+        item = timeline[t_idx]
+        beat_time = max(0.0, t_sec - item["start_sec"])
+        step_time = max(0.0, t_sec - item["step_start_sec"])
+        speech_dur = max(0.01, item["speech_end_sec"] - item["start_sec"])
+        p_beat = min(1.0, beat_time / speech_dur)
+        scene_time = max(0.0, t_sec - scene_start_times[item["scene_idx"]])
+        show_sub = item["sub"] if t_sec <= item["speech_end_sec"] + 0.12 else ""
+
+        if item["continuous"]:
+            # The narration may be holding while the last gesture is still settling.
+            cache_key = None
+        else:
+            settled = step_time >= max(DOM_ENTER_SEC, item["anim_settle_sec"])
+            cache_key = (item["global_idx"], bool(show_sub), True) if settled else None
+
+        entries.append(
+            {
+                "payload": {
+                    "sceneIdx": item["scene_idx"],
+                    "sceneId": item["scene_id"],
+                    "beatIdx": item["beat_idx"],
+                    "cue": item["cue"],
+                    "p": p_beat,
+                    "sceneTime": scene_time,
+                    "beatTime": beat_time,
+                    "stepTime": step_time,
+                    "marks": item.get("marks", {}),
+                    "sub": show_sub,
+                    "totalProgress": min(1.0, t_sec / total_dur),
+                },
+                "cache_key": cache_key,
+            }
+        )
+    return entries
+
+
+def _compose_frame(page, frame, return_page_png=False):
+    """Draw the frame, supplying native page pixels if the compositor requests them."""
+    request = page.evaluate("window.prepareVideoFrame", frame)
+    while request:
+        kind = request["kind"]
+        options = {}
+        if kind == "plate":
+            options["style"] = ".scene.active > canvas.mg-stage { visibility: hidden !important; }"
+        elif kind == "clip":
+            options["clip"] = request["clip"]
+        png = page.screenshot(type="png", **options)
+        if return_page_png and kind == "page":
+            return png
+        request = page.evaluate("window.useCapture", {
+            "kind": kind, "png": base64.b64encode(png).decode("ascii"),
+        })
+    return None
+
+
+def _render_via_webcodecs(
     episode: Episode,
-    out_dir: str,
-    work_dir: Optional[str] = None,
-    voice: str = DEFAULT_VOICE,
-    rate: str = DEFAULT_RATE,
-    katex_dir: Optional[str] = None,
-) -> dict:
-    t_start = time.time()
-    cache_root = get_cache_root()
-    work_root = work_dir or os.path.join(cache_root, "episode_build")
-    audio_cache_dir = os.path.join(cache_root, "audio_cache")
-    os.makedirs(out_dir, exist_ok=True)
-    ep_work = os.path.join(work_root, f"ep_{episode.ep_num}")
-    os.makedirs(ep_work, exist_ok=True)
+    ep_work: str,
+    html_path: str,
+    katex_dir: str,
+    wav_path: str,
+    out_mp4: str,
+    entries: List[dict],
+    fps: int,
+    preset: str = "fast",
+) -> Tuple[bool, int]:
+    """Encode crisp constant-quantizer VP9 in Chromium via WebCodecs, then transcode cleanly to CRF-16 H.264 MP4."""
+    with open(html_path, "r", encoding="utf-8") as f:
+        raw_html = f.read()
+    http_html_path = os.path.join(ep_work, "episode_http.html")
+    with open(http_html_path, "w", encoding="utf-8") as f:
+        f.write(raw_html.replace(Path(katex_dir).resolve().as_uri() + "/", "/katex/"))
 
-    print(
-        f"[EP {episode.ep_num}] Synthesizing audio ({sum(len(s.beats) for s in episode.scenes)} beats)...",
-        flush=True,
-    )
-    timeline = asyncio.run(
-        synth_all_beats(episode, ep_work, audio_cache_dir, voice=voice, rate=rate)
-    )
-    wav_path = os.path.join(ep_work, "full.wav")
-    srt_path = os.path.join(out_dir, os.path.splitext(episode.filename)[0] + ".srt")
-    total_dur = build_episode_wav_and_srt(timeline, wav_path, srt_path)
-    total_frames = int(round(total_dur * FPS))
-    print(
-        f"[EP {episode.ep_num}] Audio ready: {total_dur:.2f}s ({total_frames} frames @ {FPS}fps)",
-        flush=True,
-    )
+    srv, port = _start_local_asset_server(ep_work, katex_dir)
+    ivf_path = os.path.join(ep_work, "video.ivf")
+    h264_path = os.path.join(ep_work, "video.h264")
+    v_only_mp4 = os.path.join(ep_work, "video_only.mp4")
 
-    html_path = os.path.join(ep_work, "episode.html")
-    build_episode_html(episode, html_path, katex_dir=katex_dir)
+    try:
+        with sync_playwright() as p:
+            browser = launch_chromium(p)
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            page.goto(f"http://127.0.0.1:{port}/episode_http.html", wait_until="load")
+            page.evaluate("document.fonts.ready")
 
-    out_mp4 = os.path.join(out_dir, episode.filename)
+            enc_mode = page.evaluate(
+                """async (fps) => {
+                  if (typeof VideoEncoder === "undefined") return null;
+                  try {
+                    const s = await VideoEncoder.isConfigSupported({
+                      codec: "vp09.00.41.08", width: 1920, height: 1080,
+                      bitrateMode: "quantizer", framerate: fps
+                    });
+                    if (s.supported) return { kind: "vp9", codec: "vp09.00.41.08" };
+                  } catch (_) {}
+                  for (const c of ["avc1.64002a", "avc1.4d002a"]) {
+                    try {
+                      const s = await VideoEncoder.isConfigSupported({
+                        codec: c, width: 1920, height: 1080,
+                        bitrate: 25_000_000, bitrateMode: "constant",
+                        framerate: fps, avc: { format: "annexb" }
+                      });
+                      if (s.supported) return { kind: "avc", codec: c };
+                    } catch (_) {}
+                  }
+                  return null;
+                }""",
+                fps,
+            )
+            if not enc_mode:
+                browser.close()
+                return False, 0
+
+            use_vp9 = enc_mode["kind"] == "vp9"
+            out_raw_path = ivf_path if use_vp9 else h264_path
+            with open(out_raw_path, "wb") as raw_f:
+                if use_vp9:
+                    # Write IVF header (VP90, 1920x1080, fps/1)
+                    raw_f.write(struct.pack("<4sHH4sHHII", b"DKIF", 0, 32, b"VP90", 1920, 1080, fps, 1))
+                    raw_f.write(struct.pack("<II", len(entries), 0))
+
+                    def write_chunk(pts_idx: int, b64: str) -> None:
+                        buf = base64.b64decode(b64)
+                        raw_f.write(struct.pack("<IQ", len(buf), pts_idx))
+                        raw_f.write(buf)
+                else:
+                    def write_chunk(pts_idx: int, b64: str) -> None:
+                        raw_f.write(base64.b64decode(b64))
+
+                page.expose_function("__d2vWriteChunk", write_chunk)
+                page.add_script_tag(path=str(Path(__file__).with_name("canvas_capture.js")))
+                page.evaluate(
+                    """({ encMode, fps }) => {
+                      const compositor = createFrameCompositor();
+                      const comp = compositor.canvas;
+                      let current;
+
+                      function u8ToB64(u8) {
+                        let bin = "";
+                        const chunk = 0x8000;
+                        for (let i = 0; i < u8.length; i += chunk) {
+                          bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+                        }
+                        return btoa(bin);
+                      }
+
+                      const isVp9 = encMode.kind === "vp9";
+                      let frameIndex = 0;
+                      let written = 0;
+                      let encoderError;
+                      let pendingWrite = Promise.resolve();
+                      const enc = new VideoEncoder({
+                        output: (ch) => {
+                          const buf = new Uint8Array(ch.byteLength);
+                          ch.copyTo(buf);
+                          const pts = Math.round(ch.timestamp * fps / 1000000);
+                          written++;
+                          const b64 = u8ToB64(buf);
+                          pendingWrite = pendingWrite.then(() => window.__d2vWriteChunk(pts, b64));
+                        },
+                        error: (e) => { encoderError = e; }
+                      });
+                      if (isVp9) {
+                        enc.configure({
+                          codec: encMode.codec,
+                          width: 1920,
+                          height: 1080,
+                          bitrateMode: "quantizer",
+                          framerate: fps
+                        });
+                      } else {
+                        enc.configure({
+                          codec: encMode.codec,
+                          width: 1920,
+                          height: 1080,
+                          bitrate: 25_000_000,
+                          bitrateMode: "constant",
+                          framerate: fps,
+                          avc: { format: "annexb" }
+                        });
+                      }
+
+                      const qp = fps >= 45 ? 12 : 16;
+                      async function encode() {
+                        const i = frameIndex++;
+                        const ts = Math.round(i * 1000000 / fps);
+                        const dur = Math.round((i + 1) * 1000000 / fps) - ts;
+                        const vf = new VideoFrame(comp, {timestamp: ts, duration: dur, alpha: "discard"});
+                        const keyFrame = current.isCut || i % fps === 0;
+                        enc.encode(vf, isVp9 ? {keyFrame, vp9: {quantizer: qp}} : {keyFrame});
+                        vf.close();
+                        if (enc.encodeQueueSize > 16) await enc.flush();
+                        if (encoderError) throw encoderError;
+                      }
+
+                      window.prepareVideoFrame = async frame => {
+                        current = frame;
+                        const request = compositor.prepare(frame);
+                        if (!request) await encode();
+                        return request;
+                      };
+                      window.useCapture = async image => {
+                        const request = await compositor.supply(image);
+                        if (!request) await encode();
+                        return request;
+                      };
+                      window.finishEncoding = async () => {
+                        if (encoderError) throw encoderError;
+                        await enc.flush();
+                        enc.close();
+                        await pendingWrite;
+                        return written;
+                      };
+                    }""",
+                    {"encMode": enc_mode, "fps": fps},
+                )
+                previous_scene = None
+                for entry in entries:
+                    payload = entry["payload"]
+                    frame = dict(payload, isCut=payload["sceneIdx"] != previous_scene)
+                    previous_scene = payload["sceneIdx"]
+                    _compose_frame(page, frame)
+                rendered_count = len(entries)
+                written = page.evaluate("window.finishEncoding()")
+                if written != len(entries):
+                    raise RuntimeError(f"Encoder wrote {written} of {len(entries)} frames")
+            browser.close()
+
+        if use_vp9:
+            # Transcode lossless-grade VP9 IVF -> crisp CRF-16 H.264 MP4 (no hardware VBR smearing)
+            subprocess.run(
+                [
+                    FFMPEG, "-y", "-loglevel", "error",
+                    "-i", ivf_path, "-i", wav_path,
+                    "-c:v", "libx264", "-preset", "veryfast" if preset == "veryfast" else "fast",
+                    "-crf", "16" if fps >= 30 else "18", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-shortest", "-movflags", "+faststart", out_mp4,
+                ],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                [
+                    FFMPEG, "-y", "-loglevel", "error",
+                    "-r", str(fps), "-f", "h264", "-i", h264_path,
+                    "-c:v", "copy", v_only_mp4,
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    FFMPEG, "-y", "-loglevel", "error",
+                    "-i", v_only_mp4, "-i", wav_path,
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-shortest", "-movflags", "+faststart", out_mp4,
+                ],
+                check=True,
+            )
+        return True, rendered_count
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _render_via_screenshots(
+    episode: Episode,
+    html_path: str,
+    wav_path: str,
+    out_mp4: str,
+    entries: List[dict],
+    fps: int,
+    preset: str,
+) -> int:
+    """Fallback frame-by-frame Playwright screenshot -> ffmpeg pipeline."""
     cmd = [
         FFMPEG,
         "-y",
@@ -1066,9 +2032,9 @@ def render_episode(
         "-f",
         "image2pipe",
         "-vcodec",
-        "mjpeg",
+        "png",
         "-framerate",
-        str(FPS),
+        str(fps),
         "-i",
         "-",
         "-i",
@@ -1076,9 +2042,9 @@ def render_episode(
         "-c:v",
         "libx264",
         "-preset",
-        "fast",
+        preset,
         "-crf",
-        "17",
+        "17" if fps >= 24 else "20",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -1090,84 +2056,96 @@ def render_episode(
         "+faststart",
         out_mp4,
     ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-    )
-
-    scene_start_times = {}
-    for item in timeline:
-        if item["scene_idx"] not in scene_start_times:
-            scene_start_times[item["scene_idx"]] = item["start_sec"]
-
-    chrome_exe = find_chrome_exe()
-    t_idx = 0
-    last_cache_key = None
-    last_jpg = None
-    rendered_count = 0
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path=chrome_exe)
+    with sync_playwright() as p, tempfile.TemporaryFile() as errors:
+        browser = launch_chromium(p)
         page = browser.new_page(viewport={"width": 1920, "height": 1080})
-        page.goto("file://" + html_path, wait_until="load")
+        page.goto(Path(html_path).resolve().as_uri(), wait_until="load")
         page.evaluate("document.fonts.ready")
-
-        for f_idx in range(total_frames):
-            t_sec = (f_idx + 0.5) / FPS
-            while t_idx + 1 < len(timeline) and t_sec >= timeline[t_idx]["end_sec"]:
-                t_idx += 1
-            item = timeline[t_idx]
-            beat_time = max(0.0, t_sec - item["start_sec"])
-            step_time = max(0.0, t_sec - item["step_start_sec"])
-            speech_dur = max(0.01, item["speech_end_sec"] - item["start_sec"])
-            p_beat = min(1.0, beat_time / speech_dur)
-            scene_time = max(0.0, t_sec - scene_start_times[item["scene_idx"]])
-            show_sub = item["sub"] if t_sec <= item["speech_end_sec"] + 0.12 else ""
-
-            if item["continuous"]:
-                cache_key = None
-            else:
-                settled = step_time > item["anim_settle_sec"]
-                cache_key = (item["global_idx"], bool(show_sub), True) if settled else None
-
-            if (
-                cache_key is not None
-                and cache_key == last_cache_key
-                and last_jpg is not None
-            ):
-                proc.stdin.write(last_jpg)
-            else:
-                payload = {
-                    "sceneIdx": item["scene_idx"],
-                    "sceneId": item["scene_id"],
-                    "beatIdx": item["beat_idx"],
-                    "cue": item["cue"],
-                    "p": p_beat,
-                    "sceneTime": scene_time,
-                    "beatTime": beat_time,
-                    "stepTime": step_time,
-                    "sub": show_sub,
-                    "totalProgress": min(1.0, t_sec / total_dur),
-                }
-                page.evaluate("(p) => window.seekToState(p)", payload)
-                jpg = page.screenshot(type="jpeg", quality=95)
-                proc.stdin.write(jpg)
-                rendered_count += 1
-                last_cache_key = cache_key
-                last_jpg = jpg
-
+        page.add_script_tag(path=str(Path(__file__).with_name("canvas_capture.js")))
+        page.evaluate("""() => {
+            const compositor = createFrameCompositor();
+            window.prepareVideoFrame = compositor.prepare;
+            window.useCapture = compositor.supply;
+            window.framePNG = () => compositor.canvas.toDataURL("image/png").split(",")[1];
+        }""")
+        with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors) as proc:
+            try:
+                for entry in entries:
+                    png = _compose_frame(page, entry["payload"], return_page_png=True)
+                    if png is None:
+                        png = base64.b64decode(page.evaluate("window.framePNG()"))
+                    proc.stdin.write(png)
+            finally:
+                proc.stdin.close()
+            if proc.wait():
+                errors.seek(0)
+                raise RuntimeError(f"ffmpeg failed for EP {episode.ep_num}: {errors.read().decode(errors='replace')}")
         browser.close()
+    return len(entries)
 
-    proc.stdin.close()
-    stderr = proc.stderr.read().decode("utf-8", "ignore")
-    rc = proc.wait()
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg failed for EP {episode.ep_num}: {stderr}")
+
+def render_episode(
+    episode: Episode,
+    out_dir: str,
+    work_dir: Optional[str] = None,
+    voice: str = DEFAULT_VOICE,
+    rate: str = DEFAULT_RATE,
+    katex_dir: Optional[str] = None,
+    fps: int = FPS,
+    preset: str = "fast",
+) -> dict:
+    t_start = time.time()
+    cache_root = get_cache_root()
+    work_root = work_dir or os.path.join(cache_root, "episode_build")
+    audio_cache_dir = os.path.join(cache_root, "audio_cache")
+    os.makedirs(work_root, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    out_mp4 = os.path.join(out_dir, episode.filename)
+    srt_path = os.path.splitext(out_mp4)[0] + ".srt"
+
+    # A second course or process can use the same episode number concurrently.
+    with tempfile.TemporaryDirectory(dir=work_root) as ep_work, \
+            tempfile.TemporaryDirectory(prefix=".render-", dir=out_dir) as staging:
+        print(
+            f"[EP {episode.ep_num}] Synthesizing audio ({sum(len(s.beats) for s in episode.scenes)} beats)...",
+            flush=True,
+        )
+        timeline = asyncio.run(
+            synth_all_beats(episode, ep_work, audio_cache_dir, voice=voice, rate=rate)
+        )
+        wav_path = os.path.join(ep_work, "full.wav")
+        staged_srt = os.path.join(staging, "subtitles.srt")
+        total_dur = build_episode_wav_and_srt(timeline, wav_path, staged_srt)
+        entries = _build_frame_entries(timeline, total_dur, fps)
+        total_frames = len(entries)
+        print(
+            f"[EP {episode.ep_num}] Audio ready: {total_dur:.2f}s ({total_frames} frames @ {fps}fps)",
+            flush=True,
+        )
+
+        katex_root = ensure_katex(katex_dir)
+        html_path = os.path.join(ep_work, "episode.html")
+        build_episode_html(episode, html_path, katex_dir=katex_root, timeline=timeline)
+
+        staged_mp4 = os.path.join(staging, "video.mp4")
+        ok_wc, rendered_count = _render_via_webcodecs(
+            episode, ep_work, html_path, katex_root, wav_path, staged_mp4, entries, fps, preset
+        )
+        mode_tag = "WebCodecs"
+        if not ok_wc:
+            mode_tag = "Screenshots"
+            rendered_count = _render_via_screenshots(
+                episode, html_path, wav_path, staged_mp4, entries, fps, preset
+            )
+
+        size_mb = os.path.getsize(staged_mp4) / (1024 * 1024)
+        with publication_lock(out_dir):
+            publish_files([(Path(staged_mp4), Path(out_mp4)), (Path(staged_srt), Path(srt_path))])
 
     elapsed = time.time() - t_start
-    size_mb = os.path.getsize(out_mp4) / (1024 * 1024)
     print(
-        f"[EP {episode.ep_num}] DONE {out_mp4} ({size_mb:.1f} MB, {total_dur:.1f}s, "
-        f"rendered {rendered_count}/{total_frames} frames in {elapsed:.1f}s)",
+        f"[EP {episode.ep_num}] Rendered [{mode_tag}] ({size_mb:.1f} MB, {total_dur:.1f}s, "
+        f"{rendered_count}/{total_frames} frames drawn in {elapsed:.1f}s)",
         flush=True,
     )
     return {
@@ -1179,3 +2157,66 @@ def render_episode(
         "rendered_frames": rendered_count,
         "total_frames": total_frames,
     }
+
+
+@contextmanager
+def publication_lock(out_dir):
+    """Serialize writers on a stable lock file. Windows locks a byte, Unix the file."""
+    with open(Path(out_dir) / ".course-publish.lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+        # Closing the descriptor releases the lock, including on exceptions.
+
+
+def publish_files(files):
+    """Replace a completed set while holding publication_lock; restore older files on failure."""
+    backups = {}
+    recovery_dirs = {}
+    replaced = []
+    cleanup = True
+    try:
+        for index, (staged, target) in enumerate(files):
+            if target in backups:
+                raise ValueError(f"Duplicate publication path: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            backup = None
+            if os.path.lexists(target):
+                if not target.is_file() and not target.is_symlink():
+                    raise IsADirectoryError(str(target))
+                if target.parent not in recovery_dirs:
+                    recovery_dirs[target.parent] = Path(tempfile.mkdtemp(prefix=".publish-backup-", dir=target.parent))
+                backup = recovery_dirs[target.parent] / str(index)
+                try:
+                    os.link(target, backup, follow_symlinks=False)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(target, backup, follow_symlinks=False)
+            backups[target] = backup
+            os.replace(staged, target)
+            replaced.append(target)
+    except BaseException:
+        errors = []
+        for target in reversed(replaced):
+            try:
+                if backups[target] is None:
+                    target.unlink()
+                else:
+                    os.replace(backups[target], target)
+            except OSError as err:
+                errors.append(str(err))
+        if errors:
+            cleanup = False
+            raise RuntimeError(f"Rollback failed: {errors}. Retained backups: {list(recovery_dirs.values())}")
+        raise
+    finally:
+        if cleanup:
+            for directory in recovery_dirs.values():
+                shutil.rmtree(directory)
