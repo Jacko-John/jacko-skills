@@ -557,12 +557,39 @@ table.data thead th { background: transparent; color: var(--muted); font-size: 1
 table.data tr.hi td { background: rgba(37, 99, 235, 0.065); font-weight: 700; color: var(--ink); }
 table.data tr.focus td { background: rgba(37, 99, 235, 0.11); }
 
-/* Step transitions */
+/* Assertion-Evidence & Anchor Chips */
+.assertion-title {
+  font-size: 32px;
+  font-weight: 800;
+  line-height: 1.24;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  margin: 0 0 10px;
+}
+.term-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 15px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.90);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  box-shadow: 0 4px 14px -4px rgba(15, 23, 42, 0.06);
+  font-size: 18px;
+  color: var(--ink-2);
+}
+.term-chip b { color: var(--ink); }
+
+/* Step transitions & declarative focus signaling */
 .step { opacity: 0; transform: translateY(10px); }
 .step.show { opacity: 1; transform: translateY(0); }
 .step.focus { box-shadow: 0 18px 44px -12px rgba(37, 99, 235, 0.18), 0 0 0 1.5px rgba(37, 99, 235, 0.28) !important; }
 .step.focus-warm { box-shadow: 0 18px 44px -12px rgba(217, 72, 59, 0.18), 0 0 0 1.5px rgba(217, 72, 59, 0.28) !important; }
 .step.focus-green { box-shadow: 0 18px 44px -12px rgba(5, 150, 105, 0.18), 0 0 0 1.5px rgba(5, 150, 105, 0.28) !important; }
+.focus-dim { opacity: 0.34 !important; }
+.focus-active { opacity: 1 !important; box-shadow: 0 14px 36px -10px rgba(37, 99, 235, 0.22), 0 0 0 2px rgba(37, 99, 235, 0.38) !important; }
+.focus-active.warm { box-shadow: 0 14px 36px -10px rgba(217, 72, 59, 0.22), 0 0 0 2px rgba(217, 72, 59, 0.38) !important; }
+.focus-active.green { box-shadow: 0 14px 36px -10px rgba(5, 150, 105, 0.22), 0 0 0 2px rgba(5, 150, 105, 0.38) !important; }
 
 .svg-card {
   background: var(--surface-solid);
@@ -692,6 +719,117 @@ function svgCalloutArrow(svg, x1, y1, x2, y2, label, colorName, colorHex, anchor
     fill: colorHex, "font-size": 14.5, "font-weight": 700, text: label
   }, svg);
 }
+function svgLerp(a, b, t) { return a + (b - a) * clamp(t, 0, 1); }
+function svgSubProgress(p, t0, t1) {
+  if (t1 <= t0) return p >= t1 ? 1 : 0;
+  return clamp((p - t0) / (t1 - t0), 0, 1);
+}
+function svgRevealPath(svg, pts, color, progress, w, dash) {
+  const p = clamp(progress, 0, 1);
+  if (pts.length < 2 || p <= 0) return null;
+  if (p >= 1) return svgPolyline(svg, pts, color, w, dash);
+  const segs = [];
+  let totalLen = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+    const len = Math.hypot(dx, dy);
+    segs.push(len);
+    totalLen += len;
+  }
+  const targetLen = totalLen * p;
+  const out = [pts[0]];
+  let acc = 0;
+  for (let i = 0; i < segs.length; i++) {
+    if (acc + segs[i] <= targetLen) {
+      out.push(pts[i + 1]);
+      acc += segs[i];
+    } else {
+      const rem = segs[i] > 0 ? (targetLen - acc) / segs[i] : 0;
+      out.push([
+        pts[i][0] + (pts[i + 1][0] - pts[i][0]) * rem,
+        pts[i][1] + (pts[i + 1][1] - pts[i][1]) * rem
+      ]);
+      break;
+    }
+  }
+  return svgPolyline(svg, out, color, w, dash);
+}
+function svgBoxNode(svg, x, y, w, h, title, sub, opts) {
+  const o = opts || {};
+  const state = o.state || "idle";
+  const tones = {
+    idle: { fill: "#ffffff", stroke: "rgba(15, 23, 42, 0.16)", sw: 1.5, title: "#0f172a", op: 1 },
+    active: { fill: "#eff6ff", stroke: "#2563eb", sw: 2.5, title: "#1e40af", op: 1 },
+    warm: { fill: "#fff1f2", stroke: "#d9483b", sw: 2.5, title: "#be123c", op: 1 },
+    green: { fill: "#ecfdf5", stroke: "#059669", sw: 2.5, title: "#047857", op: 1 },
+    amber: { fill: "#fffbeb", stroke: "#d97706", sw: 2.5, title: "#b45309", op: 1 },
+    dim: { fill: "#f8fafc", stroke: "rgba(15, 23, 42, 0.10)", sw: 1.2, title: "#64748b", op: 0.42 }
+  };
+  const st = tones[state] || tones.idle;
+  const g = svgEl("g", { opacity: o.opacity !== undefined ? o.opacity : st.op }, svg);
+  svgEl("rect", {
+    x, y, width: w, height: h, rx: o.rx || 14,
+    fill: o.fill || st.fill, stroke: o.stroke || st.stroke, "stroke-width": st.sw
+  }, g);
+  const cx = x + w / 2;
+  const cy = sub ? y + h * 0.43 : y + h * 0.56;
+  svgEl("text", {
+    x: cx, y: cy, "text-anchor": "middle", fill: st.title,
+    "font-size": o.titleSize || 16.5, "font-weight": 700, text: title
+  }, g);
+  if (sub) {
+    svgEl("text", {
+      x: cx, y: y + h * 0.72, "text-anchor": "middle", fill: "#64748b",
+      "font-size": o.subSize || 13.5, class: o.subMono ? "mono-txt" : "", text: sub
+    }, g);
+  }
+  return g;
+}
+function svgBadgePill(svg, x, y, text, opts) {
+  const o = opts || {};
+  const padX = o.padX || 12;
+  const estW = Math.max(48, text.length * (o.charW || 9.5) + padX * 2);
+  const h = o.h || 28;
+  const bg = o.bg || "#eff6ff";
+  const fg = o.fg || "#1e40af";
+  const g = svgEl("g", { opacity: o.opacity !== undefined ? o.opacity : 1 }, svg);
+  svgEl("rect", {
+    x: x - estW / 2, y: y - h / 2, width: estW, height: h, rx: h / 2,
+    fill: bg, stroke: o.stroke || "rgba(37, 99, 235, 0.22)", "stroke-width": 1.2
+  }, g);
+  svgEl("text", {
+    x, y: y + 5, "text-anchor": "middle", fill: fg,
+    "font-size": o.fontSize || 13.5, "font-weight": 700, class: o.mono ? "mono-txt" : "", text
+  }, g);
+  return g;
+}
+function svgConnector(svg, x1, y1, x2, y2, opts) {
+  const o = opts || {};
+  const p = o.progress === undefined ? 1 : clamp(o.progress, 0, 1);
+  if (p <= 0.01) return null;
+  const colorName = o.colorName || "blue";
+  const colorHex = o.colorHex || "#2563eb";
+  const ex = svgLerp(x1, x2, p);
+  const ey = svgLerp(y1, y2, p);
+  const curve = o.curve || 0;
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2 - curve;
+  const d = curve === 0
+    ? `M${x1.toFixed(1)} ${y1.toFixed(1)} L${ex.toFixed(1)} ${ey.toFixed(1)}`
+    : `M${x1.toFixed(1)} ${y1.toFixed(1)} Q${mx.toFixed(1)} ${my.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`;
+  const path = svgEl("path", {
+    d, fill: "none", stroke: colorHex, "stroke-width": o.width || 2.4,
+    "stroke-dasharray": o.dash || "",
+    "marker-end": p > 0.85 ? `url(#arr-${colorName})` : "",
+    opacity: o.opacity !== undefined ? o.opacity : 1
+  }, svg);
+  if (o.label && p > 0.6) {
+    svgBadgePill(svg, mx, my - (curve === 0 ? 14 : 4), o.label, {
+      bg: o.labelBg || "#ffffff", fg: colorHex, stroke: colorHex, fontSize: 12.5
+    });
+  }
+  return path;
+}
 """
 
 
@@ -794,15 +932,26 @@ window.seekToState = function(payload) {{
   const curStep = (cue && cue.step !== undefined) ? cue.step : beatIdx;
   const enterT = Math.min(1, Math.max(0, (stepTime === undefined ? beatTime : stepTime) / 0.42));
   const ease = 1 - Math.pow(1 - enterT, 3);
-  sceneEl.querySelectorAll("[data-step]").forEach((el) => {{
-    const req = parseInt(el.getAttribute("data-step"), 10);
-    const visible = curStep >= req;
+  const isElVisible = (el) => {{
+    if (el.hasAttribute("data-step")) {{
+      const req = parseInt(el.getAttribute("data-step"), 10);
+      if (curStep < req) return false;
+    }}
+    if (el.hasAttribute("data-hide-after")) {{
+      const hideAfter = parseInt(el.getAttribute("data-hide-after"), 10);
+      if (curStep > hideAfter) return false;
+    }}
+    return true;
+  }};
+  sceneEl.querySelectorAll("[data-step], [data-hide-after]").forEach((el) => {{
+    const req = el.hasAttribute("data-step") ? parseInt(el.getAttribute("data-step"), 10) : 0;
+    const visible = isElVisible(el);
     el.classList.toggle("show", visible);
     el.classList.remove("focus", "focus-warm", "focus-green");
     if (!visible) {{
       el.style.opacity = "0";
       el.style.transform = "translateY(14px)";
-    }} else if (curStep === req && !el.hasAttribute("data-no-enter")) {{
+    }} else if (el.hasAttribute("data-step") && curStep === req && !el.hasAttribute("data-no-enter")) {{
       el.style.opacity = ease.toFixed(3);
       el.style.transform = "translateY(" + ((1 - ease) * 14).toFixed(1) + "px)";
     }} else if (el.hasAttribute("data-dim-past") && curStep > req) {{
@@ -812,12 +961,56 @@ window.seekToState = function(payload) {{
       el.style.opacity = "1";
       el.style.transform = "translateY(0)";
     }}
-    if (curStep === req && el.hasAttribute("data-focus-style")) {{
+    if (visible && el.hasAttribute("data-step") && curStep === req && el.hasAttribute("data-focus-style")) {{
       el.classList.add(el.getAttribute("data-focus-style"));
-    }} else if (curStep === req && el.classList.contains("card")) {{
+    }} else if (visible && el.hasAttribute("data-step") && curStep === req && el.classList.contains("card")) {{
       el.classList.add("focus");
     }}
   }});
+
+  // Declarative sub-element focus signaling: dim inactive siblings inside [data-focus-group]
+  const focusSet = new Set();
+  if (cue && cue.focus !== undefined && cue.focus !== null) {{
+    const raw = Array.isArray(cue.focus) ? cue.focus : String(cue.focus).split(",");
+    raw.forEach((s) => {{ const t = String(s).trim(); if (t) focusSet.add(t); }});
+  }}
+  const matchesFocus = (el) => {{
+    const fid = el.getAttribute("data-focus-id");
+    if (fid && focusSet.has(fid)) return true;
+    const fs = el.getAttribute("data-focus-step") || el.getAttribute("data-focus-steps");
+    if (fs) {{
+      return fs.split(",").some((part) => parseInt(part.trim(), 10) === curStep);
+    }}
+    return false;
+  }};
+  sceneEl.querySelectorAll("[data-focus-step], [data-focus-steps], [data-focus-id]").forEach((el) => {{
+    el.classList.remove("focus-active", "focus-dim", "warm", "green");
+  }});
+  sceneEl.querySelectorAll("[data-focus-group]").forEach((grp) => {{
+    const items = Array.from(grp.querySelectorAll("[data-focus-step], [data-focus-steps], [data-focus-id]"))
+      .filter((el) => isElVisible(el));
+    const activeItems = items.filter(matchesFocus);
+    if (activeItems.length > 0) {{
+      items.forEach((el) => {{
+        if (activeItems.includes(el)) {{
+          el.classList.add("focus-active");
+          const tone = el.getAttribute("data-focus-tone");
+          if (tone === "warm" || tone === "green") el.classList.add(tone);
+        }} else {{
+          el.classList.add("focus-dim");
+        }}
+      }});
+    }}
+  }});
+  if (focusSet.size > 0) {{
+    sceneEl.querySelectorAll("[data-focus-id]").forEach((el) => {{
+      if (isElVisible(el) && matchesFocus(el) && !el.closest("[data-focus-group]")) {{
+        el.classList.add("focus-active");
+        const tone = el.getAttribute("data-focus-tone");
+        if (tone === "warm" || tone === "green") el.classList.add(tone);
+      }}
+    }});
+  }}
 
   const ctx = {{ sceneEl, beatIdx, cue: cue || {{}}, p, sceneTime, beatTime, stepTime: stepTime === undefined ? beatTime : stepTime }};
   {chr(10).join(frame_cases)}

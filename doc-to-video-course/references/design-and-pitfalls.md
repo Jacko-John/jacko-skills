@@ -1,22 +1,31 @@
 # Design Guidelines & Verified Technical Pitfalls
 
+See [pedagogy-and-choreography.md](./pedagogy-and-choreography.md) for instructional sequencing, Zoom-Lens pacing, and narration–animation synchronization rules.
+
 ## 1. Visual Design System (Modern Keynote Studio)
 - **Atmosphere**: Warm alabaster (`#faf9f6`) with subtle radial ambient lighting and `28px` micro dot-grid; avoid heavy gray borders around every text block.
+- **Assertion-Evidence Slide Copy**:
+  - Use `.assertion-title` / `.k-title` for a **single-sentence takeaway claim** (what the viewer should conclude), not a generic section noun.
+  - Keep body text to **short visual anchors** (`.term-chip`, `.kv` pills, 1-line `.note-block` labels, math stages, code windows). Never put narrative paragraphs on screen that repeat what TTS speaks (`validate_episodes.py` warns on dense text > 85 chars).
 - **Spatial Variety**: Mix layouts across consecutive scenes instead of repeating the same 2-column card box:
   - Centered Hero / Equation Spotlight (oversized `.math-stage` + 3 borderless columns below)
   - `.studio-split` (`.studio-left` open `.note-block` accents with `data-dim-past="1"` + `.studio-right` elevated `.svg-card` / `.glass-panel`)
   - `.code-window` (macOS-style `#0b1120` dark window chrome + `.code-line.hi` spotlight bar)
   - Borderless Linear-style `table.data` (hairline horizontal dividers only)
-- **Charts & Vector Graphics**:
+- **Charts & Teaching Vector Graphics**:
   - `svgFrame()` draws horizontal hairline guides and baseline only (no closed outer box).
   - Use `svgAreaPolyline(svg, pts, color, gradId, baseY)` for shaded area curves (`grad-blue`, `grad-red`, `grad-green`, `grad-amber`).
+  - Use `svgRevealPath(svg, pts, color, progress, w, dash)` to draw curves progressively over `ctx.p`, and draw a dashed ghost baseline before sweeping parameters so viewers compare before vs. after.
+  - Use `svgBoxNode(...)`, `svgConnector(...)`, and `svgBadgePill(...)` for mechanism/pipeline diagrams with active/dimmed states (`'active'`, `'dim'`, `'warm'`, `'green'`), and `svgSubProgress(p, t0, t1)` for clean intra-beat staging.
   - Use `svgDot(svg, x, y, color, r, true)` for glowing halo markers and `svgCalloutArrow(...)` for curved leader-line annotations pointing directly to curve peaks/kinks.
 - **Lightweight Subtitle Strip**: `rgba(255, 255, 255, 0.86)` frosted capsule at `bottom: 24px` (`25.5px` crisp `#0f172a` ink) — high contrast without looking like a heavy black block.
 
-## 2. Safe-Area Layout Rules (`1920 × 1080`)
+## 2. Safe-Area Layout Rules & Declarative Focus (`1920 × 1080`)
 - **Top header bar**: `68px` tall (`y = 0..68`).
-- **Content stage**: `padding: 26px 68px 104px`, meaning all visible elements **must end at `y <= 974px`** (`validate_episodes.py` enforces `maxBottom <= 968` by default for extra breathing room above the subtitle strip).
-- **Progressive reveal (no ghosting future steps!)**: Never draw unrevealed future sections at `opacity: 0.35` or `0.40`. Keep unrevealed content completely hidden (`opacity: 0`) until its step arrives, then fade/slide it in smoothly over `~0.45s` (which falls inside `anim_settle_sec = 0.75s` so `video_engine.py` captures smooth 30fps entrance frames automatically).
+- **Content stage**: `padding: 26px 68px 104px`, meaning all visible elements **must end at `y <= 974px`** (`validate_episodes.py` enforces `maxBottom <= 968` by default across **all beats** for extra breathing room above the subtitle strip).
+- **Progressive reveal (no premature or ghosted future steps!)**: Never draw unrevealed future sections at `opacity: 0.35` or `0.40`, and never assign `data-step="0"` to blocks that are not explained until Beat 1 or 2. Keep unrevealed content at `opacity: 0` until its Beat arrives.
+- **Declarative sibling focus (`data-focus-group`)**: Wrap multi-item anchors (`.term-chip`, `.note-block`, table rows, diagram cards) in `data-focus-group` and mark items with `data-focus-step="1"` / `data-focus-steps="1,2"` or `data-focus-id="x"` (triggered by `cue={"focus": "x"}`). Active items get `.focus-active` (optional `data-focus-tone="warm|green"`) while inactive visible siblings automatically dim to `0.34`.
+- **Temporary scaffolding cleanup (`data-hide-after`)**: Add `data-hide-after="1"` to temporary hints or quiz prompts that should vanish cleanly when advancing to later steps.
 - **Never mix `svgFrame()` with prior elements in the same `<svg>`**: `svgFrame()` resets `svg.innerHTML = ""` and wipes out any preceding shapes/labels. Always split stacked diagrams or charts into separate `<svg>` containers (e.g., `#top-svg` and `#bot-svg`).
 - **Avoid tall multi-row SVG stacks**: When stacking 2 SVGs vertically in a `.svg-card`, cap their combined `viewBox` heights around `540–580px` total so readout pills sit cleanly above `968px`.
 

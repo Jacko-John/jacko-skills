@@ -77,90 +77,112 @@ def main():
             if raw_dollars:
                 dollar_leaks.append(f"EP {ep.ep_num}")
 
+            pedagogy_warns: list[str] = []
             for si, sc in enumerate(ep.scenes):
                 if not sc.beats:
                     overflows.append(f"EP {ep.ep_num} {sc.scene_id}: empty beats")
                     continue
-                for bi in sorted({0, len(sc.beats) - 1}):
-                    bt = sc.beats[bi]
-                    page.evaluate(
-                        "(p) => window.seekToState(p)",
-                        {
-                            "sceneIdx": si,
-                            "sceneId": sc.scene_id,
-                            "beatIdx": bi,
-                            "cue": bt.cue,
-                            "p": 0.72,
-                            "sceneTime": 2.5,
-                            "beatTime": 1.0,
-                            "stepTime": 1.0,
-                            "sub": bt.sub,
-                            "totalProgress": (si + 0.5) / max(1, len(ep.scenes)),
-                        },
-                    )
-                    ov = page.evaluate(
-                        """() => {
-                          const st = document.querySelector('.stage');
-                          const sc = document.querySelector('.scene.active');
-                          let maxBottom = 0;
-                          for (const k of sc.querySelectorAll('.card, .glass-panel, .svg-card, .code-window, .math-stage, .callout, pre, table, svg')) {
-                            const r = k.getBoundingClientRect();
-                            if (r.height > 0 && parseFloat(getComputedStyle(k).opacity) > 0.01) {
-                              maxBottom = Math.max(maxBottom, r.bottom);
-                            }
-                          }
-                          const svgIssues = [];
-                          sc.querySelectorAll('svg').forEach((svg, idx) => {
-                            const sRect = svg.getBoundingClientRect();
-                            if (sRect.width === 0 || parseFloat(getComputedStyle(svg).opacity) <= 0.01) return;
-                            const texts = Array.from(svg.querySelectorAll('text')).map(t => ({
-                              node: t,
-                              text: t.textContent.trim(),
-                              r: t.getBoundingClientRect(),
-                              op: parseFloat(getComputedStyle(t).opacity)
-                            })).filter(x => x.r.width > 0 && x.op > 0.05);
-                            for (let i = 0; i < texts.length; i++) {
-                              const a = texts[i];
-                              if (a.r.left < sRect.left - 8 || a.r.right > sRect.right + 8 || a.r.top < sRect.top - 8 || a.r.bottom > sRect.bottom + 8) {
-                                svgIssues.push('SVG#' + idx + ' text out of bounds: ' + a.text);
-                              }
-                              for (let j = i + 1; j < texts.length; j++) {
-                                const b = texts[j];
-                                const ix = Math.max(0, Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left));
-                                const iy = Math.max(0, Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top));
-                                if (ix > 4 && iy > 3) {
-                                  svgIssues.push('SVG#' + idx + ' text overlap: \"' + a.text + '\" vs \"' + b.text + '\"');
+                if len(sc.beats) > 1 and not any(b.continuous for b in sc.beats):
+                    distinct_cues = {repr(sorted(b.cue.items())) for b in sc.beats}
+                    if len(distinct_cues) <= 1:
+                        pedagogy_warns.append(
+                            f"EP {ep.ep_num} {sc.scene_id}: all {len(sc.beats)} beats share identical cue (static slide)"
+                        )
+                seen_dense_texts: set[str] = set()
+                for bi, bt in enumerate(sc.beats):
+                    p_checks = (0.12, 0.92) if bt.continuous else (0.72,)
+                    for p_val in p_checks:
+                        page.evaluate(
+                            "(p) => window.seekToState(p)",
+                            {
+                                "sceneIdx": si,
+                                "sceneId": sc.scene_id,
+                                "beatIdx": bi,
+                                "cue": bt.cue,
+                                "p": p_val,
+                                "sceneTime": 2.5,
+                                "beatTime": 1.0,
+                                "stepTime": 1.0,
+                                "sub": bt.sub,
+                                "totalProgress": (si + (bi + 0.5) / len(sc.beats)) / max(1, len(ep.scenes)),
+                            },
+                        )
+                        ov = page.evaluate(
+                            """() => {
+                              const st = document.querySelector('.stage');
+                              const sc = document.querySelector('.scene.active');
+                              let maxBottom = 0;
+                              for (const k of sc.querySelectorAll('.card, .glass-panel, .svg-card, .code-window, .math-stage, .callout, pre, table, svg')) {
+                                const r = k.getBoundingClientRect();
+                                if (r.height > 0 && parseFloat(getComputedStyle(k).opacity) > 0.01) {
+                                  maxBottom = Math.max(maxBottom, r.bottom);
                                 }
                               }
-                            }
-                            // Check if any large container rect overlaps an earlier visible text node
-                            const children = Array.from(svg.children);
-                            for (let ci = 0; ci < children.length; ci++) {
-                              const ch = children[ci];
-                              if (ch.tagName.toLowerCase() !== 'rect') continue;
-                              const rr = ch.getBoundingClientRect();
-                              if (rr.width < 120 || rr.height < 80 || parseFloat(getComputedStyle(ch).opacity) <= 0.05) continue;
-                              for (const t of texts) {
-                                const tIdx = children.indexOf(t.node);
-                                if (tIdx >= 0 && tIdx < ci) {
-                                  const ix = Math.max(0, Math.min(rr.right, t.r.right) - Math.max(rr.left, t.r.left));
-                                  const iy = Math.max(0, Math.min(rr.bottom, t.r.bottom) - Math.max(rr.top, t.r.top));
-                                  if (ix > 6 && iy > 4) {
-                                    svgIssues.push('SVG#' + idx + ' later rect covers earlier text: ' + t.text);
+                              const longTexts = [];
+                              sc.querySelectorAll('.note-block p, .card p, .callout').forEach((el) => {
+                                if (parseFloat(getComputedStyle(el).opacity) > 0.05) {
+                                  const txt = el.innerText.replace(/\\s+/g, ' ').trim();
+                                  if (txt.length > 85) longTexts.push(txt.slice(0, 40) + '... (' + txt.length + ' chars)');
+                                }
+                              });
+                              const svgIssues = [];
+                              sc.querySelectorAll('svg').forEach((svg, idx) => {
+                                const sRect = svg.getBoundingClientRect();
+                                if (sRect.width === 0 || parseFloat(getComputedStyle(svg).opacity) <= 0.01) return;
+                                const texts = Array.from(svg.querySelectorAll('text')).map(t => ({
+                                  node: t,
+                                  text: t.textContent.trim(),
+                                  r: t.getBoundingClientRect(),
+                                  op: parseFloat(getComputedStyle(t).opacity)
+                                })).filter(x => x.r.width > 0 && x.op > 0.05);
+                                for (let i = 0; i < texts.length; i++) {
+                                  const a = texts[i];
+                                  if (a.r.left < sRect.left - 8 || a.r.right > sRect.right + 8 || a.r.top < sRect.top - 8 || a.r.bottom > sRect.bottom + 8) {
+                                    svgIssues.push('SVG#' + idx + ' text out of bounds: ' + a.text);
+                                  }
+                                  for (let j = i + 1; j < texts.length; j++) {
+                                    const b = texts[j];
+                                    const ix = Math.max(0, Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left));
+                                    const iy = Math.max(0, Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top));
+                                    if (ix > 4 && iy > 3) {
+                                      svgIssues.push('SVG#' + idx + ' text overlap: "' + a.text + '" vs "' + b.text + '"');
+                                    }
                                   }
                                 }
-                              }
-                            }
-                          });
-                          return { scrollH: st.scrollHeight, clientH: st.clientHeight, maxBottom, svgIssues };
-                        }"""
-                    )
-                    if ov["scrollH"] > ov["clientH"] + 2 or ov["maxBottom"] > args.max_bottom:
-                        overflows.append(
-                            f"EP {ep.ep_num} {sc.scene_id} beat {bi}: {ov}"
+                                // Check if any large container rect overlaps an earlier visible text node
+                                const children = Array.from(svg.children);
+                                for (let ci = 0; ci < children.length; ci++) {
+                                  const ch = children[ci];
+                                  if (ch.tagName.toLowerCase() !== 'rect') continue;
+                                  const rr = ch.getBoundingClientRect();
+                                  if (rr.width < 120 || rr.height < 80 || parseFloat(getComputedStyle(ch).opacity) <= 0.05) continue;
+                                  for (const t of texts) {
+                                    const tIdx = children.indexOf(t.node);
+                                    if (tIdx >= 0 && tIdx < ci) {
+                                      const ix = Math.max(0, Math.min(rr.right, t.r.right) - Math.max(rr.left, t.r.left));
+                                      const iy = Math.max(0, Math.min(rr.bottom, t.r.bottom) - Math.max(rr.top, t.r.top));
+                                      if (ix > 6 && iy > 4) {
+                                        svgIssues.push('SVG#' + idx + ' later rect covers earlier text: ' + t.text);
+                                      }
+                                    }
+                                  }
+                                }
+                              });
+                              return { scrollH: st.scrollHeight, clientH: st.clientHeight, maxBottom, svgIssues, longTexts };
+                            }"""
                         )
-                    for si_msg in ov.get("svgIssues", []):
-                        overflows.append(f"EP {ep.ep_num} {sc.scene_id} beat {bi}: {si_msg}")
+                        if ov["scrollH"] > ov["clientH"] + 2 or ov["maxBottom"] > args.max_bottom:
+                            overflows.append(
+                                f"EP {ep.ep_num} {sc.scene_id} beat {bi} (p={p_val}): {ov}"
+                            )
+                        for si_msg in ov.get("svgIssues", []):
+                            overflows.append(f"EP {ep.ep_num} {sc.scene_id} beat {bi} (p={p_val}): {si_msg}")
+                        for lt in ov.get("longTexts", []):
+                            if lt not in seen_dense_texts:
+                                seen_dense_texts.add(lt)
+                                pedagogy_warns.append(
+                                    f"EP {ep.ep_num} {sc.scene_id} beat {bi}: dense slide prose (>85 chars, risk of narration redundancy): {lt}"
+                                )
                 if args.sample_dir:
                     page.screenshot(
                         path=os.path.join(
@@ -169,6 +191,8 @@ def main():
                         type="jpeg",
                         quality=88,
                     )
+            for pw in pedagogy_warns:
+                print(f"[PEDAGOGY WARN] {pw}")
             print(
                 f"[OK] EP {ep.ep_num}: {len(ep.scenes)} scenes, {sum(len(s.beats) for s in ep.scenes)} beats checked"
             )
